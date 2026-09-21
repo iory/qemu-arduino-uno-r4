@@ -29,9 +29,15 @@ src=$(WORK="$WORK" "$ROOT/prepare-source.sh")
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo ">> building the Emscripten container (takes a while the first time)"
-    docker build -t "$IMAGE" \
-        -f "$src/tests/docker/dockerfiles/emsdk-wasm64-cross.docker" \
-        "$src/tests/docker/dockerfiles"
+    # The Dockerfile fetches zlib from zlib.net with `curl -Ls`, so an outage
+    # there feeds an error page to tar. Take the same version from zlib's
+    # GitHub releases instead, and let curl fail loudly.
+    dockerfile="$WORK/emsdk-wasm64-cross.docker"
+    sed 's|curl -Ls https://zlib.net/zlib-\$ZLIB_VERSION|curl -fLs --retry 3 https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION|' \
+        "$src/tests/docker/dockerfiles/emsdk-wasm64-cross.docker" > "$dockerfile"
+    grep -q 'github.com/madler/zlib' "$dockerfile" \
+        || { echo "error: zlib URL in the Dockerfile not found; update $0" >&2; exit 1; }
+    docker build -t "$IMAGE" -f "$dockerfile" "$src/tests/docker/dockerfiles"
 fi
 
 echo ">> building qemu-system-arm.js ($JOBS jobs)"

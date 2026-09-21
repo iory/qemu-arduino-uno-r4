@@ -38,6 +38,10 @@ fi
 src="qemu-$QEMU_VERSION"
 echo ">> unpacking and applying patches" >&2
 rm -rf "$src"
+# MSYS2 emulates symlinks by copying their target, which fails for the few
+# dangling ones in the tree (e.g. in roms/edk2). None of them matter for the
+# build; make them Windows shortcuts instead.
+case $(uname -s) in MINGW*|MSYS*) export MSYS=winsymlinks:lnk;; esac
 tar xf "$tarball"
 for p in "$ROOT"/patches/*.patch; do
     echo "   $(basename "$p")" >&2

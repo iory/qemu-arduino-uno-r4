@@ -74,16 +74,35 @@ qemu-system-arm -M arduino-uno-r4 -kernel .pio/build/sim/firmware.elf \
 ```sh
 # Debian/Ubuntu
 sudo apt install build-essential ninja-build pkg-config \
-                 libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv python3-tomli curl
+                 libglib2.0-dev python3-venv python3-tomli curl git
 # macOS
-brew install ninja pkgconf glib pixman dtc
+brew install ninja pkgconf glib
 
 ./build.sh                     # -> dist/bin/qemu-system-arm
 tests/smoke.sh                 # boots tests/hello and checks its output
 ```
 
 `build.sh` downloads the QEMU release pinned in `QEMU_VERSION`, checks its
-SHA-256, applies `patches/` and builds only `qemu-system-arm`.
+SHA-256, applies `patches/` and builds only `qemu-system-arm`, with none of
+QEMU's optional host features (no display, audio, network back ends, …).
+The only library it needs at run time is glib; libfdt comes from the copy
+QEMU pins and is linked in statically.
+
+On macOS, `scripts/bundle-macos.sh dist` copies glib and its dependencies
+into `dist/lib` and points the binary there, so it runs without Homebrew.
+
+### Native (Windows)
+
+In an [MSYS2](https://www.msys2.org/) **UCRT64** shell:
+
+```sh
+pacman -S git curl patch tar xz diffutils \
+          mingw-w64-ucrt-x86_64-{gcc,glib2,ninja,pkgconf,python}
+
+./build.sh                     # -> dist/bin/qemu-system-arm.exe
+scripts/bundle-windows.sh dist # copies the DLLs it needs next to it
+tests/smoke.sh dist/bin/qemu-system-arm.exe
+```
 
 ### WebAssembly
 
@@ -123,16 +142,28 @@ serial output against the text.
 
 ## Releases
 
-Pushing a tag `v<qemu-version>-unor4.<n>` (e.g. `v11.1.1-unor4.1`) builds
+Pushing a tag `v<qemu-version>-unor4.<n>` (e.g. `v11.1.1-unor4.2`) builds
 and publishes:
 
-- `qemu-system-arm` for Linux x86_64 and arm64
-- `qemu-system-arm.{js,wasm}` for WebAssembly
-- the complete patched QEMU source tree it was built from
+| Asset | Contents | Needs |
+| --- | --- | --- |
+| `…-linux-x86_64.tar.gz`, `…-linux-arm64.tar.gz` | `bin/qemu-system-arm` | glib (`libglib2.0-0`), present on almost every distribution; glibc 2.35 or newer (Ubuntu 22.04+) |
+| `…-macos-arm64.tar.gz` | `bin/qemu-system-arm` and `lib/` | Apple silicon, macOS 14 or newer |
+| `…-windows-x86_64.zip` | `bin/qemu-system-arm.exe` and its DLLs | Windows 10/11 (x64; runs on ARM64 under emulation) |
+| `…-wasm.tar.gz` | `qemu-system-arm.{js,wasm}` | see [WebAssembly](#webassembly) |
+| `…-source.tar.xz` | the complete patched QEMU tree the binaries were built from, with these scripts | |
 
-The Linux binaries are dynamically linked against glib, pixman and libfdt.
-On Debian/Ubuntu: `sudo apt install libglib2.0-0 libpixman-1-0 libfdt1`
-(the first two are on almost every desktop already).
+`SHA256SUMS` lists the checksums of all of them.
+
+The macOS binary is signed ad hoc, not notarized. A tarball downloaded with a
+browser is quarantined, and macOS then refuses to run it; clear the flag once
+after unpacking:
+
+```sh
+xattr -dr com.apple.quarantine qemu-arduino-uno-r4-*-macos-arm64
+```
+
+(`curl` does not set the flag, so this is not needed for scripted downloads.)
 
 ## Upstreaming
 
