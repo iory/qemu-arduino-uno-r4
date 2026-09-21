@@ -13,7 +13,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-14]
+        # macos-15-intel is the last Intel macOS runner (until fall 2027):
+        # https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-14, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +44,10 @@ jobs:
         run: |
           scripts/bundle-macos.sh dist
           tests/smoke.sh
+          # the oldest macOS the bundle runs on is that of its dylibs
+          for f in dist/bin/qemu-system-arm dist/lib/*.dylib; do
+            echo "$f: $(otool -l "$f" | awk '/minos/ {print $2; exit}')"
+          done
 
   windows:
     name: windows (${{ matrix.msystem }})
