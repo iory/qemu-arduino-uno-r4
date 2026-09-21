@@ -1,0 +1,447 @@
+From 6ca3be32f48e8ad6061b17949baef8f763957f3d Mon Sep 17 00:00:00 2001
+From: Iori Yanokura <ab.ioryz@gmail.com>
+Date: Mon, 21 Sep 2026 14:51:37 +0900
+Subject: [PATCH 5/5] hw/arm: Add Renesas RA4M1 SoC and Arduino UNO R4 board
+
+Add the RA4M1 (R7FA4M1AB, Cortex-M4F) with its ICU, SCI0/1/2/9, AGT0/1
+and I/O ports, plus the arduino-uno-r4 board that boots sketches built by
+the Arduino/PlatformIO toolchain. Sketches are linked at 0x4000, after the
+bootloader, so the board sets the reset VTOR there.
+
+The clock generator reports every oscillator as stable and FCACHE reads
+as zero (the FSP waits for FCACHEIV to self-clear). serial0 is SCI9,
+where Serial goes when the core is built with -DNO_USB; since it stands
+in for USB CDC it transmits much faster than 115200 baud. serial1 is SCI2
+(Serial1, pins D0/D1).
+---
+ hw/arm/Kconfig             |  15 +++
+ hw/arm/arduino_uno_r4.c    |  68 +++++++++++
+ hw/arm/meson.build         |   3 +
+ hw/arm/ra4m1_soc.c         | 233 +++++++++++++++++++++++++++++++++++++
+ include/hw/arm/ra4m1_soc.h |  62 ++++++++++
+ 5 files changed, 381 insertions(+)
+ create mode 100644 hw/arm/arduino_uno_r4.c
+ create mode 100644 hw/arm/ra4m1_soc.c
+ create mode 100644 include/hw/arm/ra4m1_soc.h
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 6f5b2ad..5faf224 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -727,3 +727,18 @@ config ARMSSE
+     select UNIMP
+     select SSE_COUNTER
+     select SSE_TIMER
++
++config ARDUINO_UNO_R4
++    bool
++    default y
++    depends on TCG && ARM
++    select RA4M1_SOC
++
++config RA4M1_SOC
++    bool
++    select ARM_V7M
++    select RENESAS_RA_ICU
++    select RENESAS_RA_SCI
++    select RENESAS_RA_AGT
++    select RENESAS_RA_IOPORT
++    select UNIMP
+diff --git a/hw/arm/arduino_uno_r4.c b/hw/arm/arduino_uno_r4.c
+new file mode 100644
+index 0000000..4c8eea2
+--- /dev/null
++++ b/hw/arm/arduino_uno_r4.c
+@@ -0,0 +1,68 @@
++/*
++ * Arduino UNO R4 (Renesas RA4M1)
++ *
++ * Boots a sketch built by the Arduino / PlatformIO toolchain: the ELF is
++ * linked at 0x4000, after the space the Arduino bootloader occupies.
++ * serial0 is SCI9 (Serial when the core is built with -DNO_USB),
++ * serial1 is SCI2 (Serial1, pins D0/D1).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/core/boards.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-clock.h"
++#include "system/system.h"
++#include "hw/arm/ra4m1_soc.h"
++#include "hw/arm/boot.h"
++#include "hw/arm/machines-qom.h"
++
++#define UNO_R4_ICLK_HZ   48000000ULL    /* HOCO 48 MHz */
++#define UNO_R4_PCLKB_HZ  24000000ULL    /* ICLK / 2 */
++#define UNO_R4_APP_BASE  0x4000         /* after the bootloader */
++
++static void arduino_uno_r4_init(MachineState *machine)
++{
++    DeviceState *dev;
++    RA4M1State *soc;
++    Clock *iclk, *pclkb;
++
++    iclk = clock_new(OBJECT(machine), "ICLK");
++    clock_set_hz(iclk, UNO_R4_ICLK_HZ);
++    pclkb = clock_new(OBJECT(machine), "PCLKB");
++    clock_set_hz(pclkb, UNO_R4_PCLKB_HZ);
++
++    dev = qdev_new(TYPE_RA4M1_SOC);
++    soc = RA4M1_SOC(dev);
++    object_property_add_child(OBJECT(machine), "soc", OBJECT(dev));
++    qdev_connect_clock_in(dev, "iclk", iclk);
++    qdev_connect_clock_in(dev, "pclkb", pclkb);
++    qdev_prop_set_uint32(dev, "init-svtor", UNO_R4_APP_BASE);
++    qdev_prop_set_chr(DEVICE(&soc->sci[3]), "chardev", serial_hd(0)); /* SCI9 */
++    /*
++     * On the real board Serial is USB CDC, which is not limited to 115200
++     * baud. SCI9 stands in for it, so let it send about as fast as USB.
++     */
++    object_property_set_int(OBJECT(&soc->sci[3]), "char-time-ns", 1000,
++                            &error_abort);
++    qdev_prop_set_chr(DEVICE(&soc->sci[2]), "chardev", serial_hd(1)); /* SCI2 */
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
++
++    armv7m_load_kernel(soc->armv7m.cpu, machine->kernel_filename,
++                       0, RA4M1_FLASH_SIZE);
++}
++
++static void arduino_uno_r4_machine_init(MachineClass *mc)
++{
++    static const char * const valid_cpu_types[] = {
++        ARM_CPU_TYPE_NAME("cortex-m4"),
++        NULL
++    };
++
++    mc->desc = "Arduino UNO R4 (Renesas RA4M1, Cortex-M4)";
++    mc->init = arduino_uno_r4_init;
++    mc->valid_cpu_types = valid_cpu_types;
++}
++
++DEFINE_MACHINE_ARM("arduino-uno-r4", arduino_uno_r4_machine_init)
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index 4233a80..3ce5855 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -110,6 +110,9 @@ arm_common_ss.add(when: 'CONFIG_SX1', if_true: files('omap_sx1.c'))
+ arm_common_ss.add(when: 'CONFIG_VERSATILE', if_true: files('versatilepb.c'))
+ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
+ 
++arm_common_ss.add(when: 'CONFIG_ARDUINO_UNO_R4', if_true: files('arduino_uno_r4.c'))
++arm_common_ss.add(when: 'CONFIG_RA4M1_SOC', if_true: files('ra4m1_soc.c'))
++
+ arm_common_ss.add(files('boot.c'))
+ 
+ hw_common_arch += {'arm': arm_common_ss}
+diff --git a/hw/arm/ra4m1_soc.c b/hw/arm/ra4m1_soc.c
+new file mode 100644
+index 0000000..013d043
+--- /dev/null
++++ b/hw/arm/ra4m1_soc.c
+@@ -0,0 +1,233 @@
++/*
++ * Renesas RA4M1 (R7FA4M1AB) SoC
++ *
++ * Just enough of the chip for the Renesas FSP and the Arduino UNO R4 core
++ * to boot and run: the ICU, the SCI UARTs and the AGT timers are modelled;
++ * the clock generator answers "stable" to every poll; the I/O ports are
++ * modelled; a few control blocks are plain registers; everything else is unimplemented
++ * (reads as zero, logged with -d unimp).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "system/address-spaces.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-clock.h"
++#include "hw/misc/unimp.h"
++#include "hw/arm/ra4m1_soc.h"
++
++#define ICU_BASE     0x40006000
++#define SYSTEM_BASE  0x4001e000
++#define FCACHE_BASE  0x4001c000
++#define PORT_BASE    0x40040000
++#define MSTP_BASE    0x40047000
++#define AGT_BASE     0x40084000
++#define SCI_BASE     0x40070000
++
++/* SYSTEM registers the FSP polls during clock start-up */
++#define SYSTEM_OSCSF   0x03c    /* oscillation stabilization flags */
++#define SYSTEM_VBTSR   0x4b1    /* VBATT status: VBTRVLD */
++
++static const struct {
++    hwaddr base;
++    int event;                  /* RXI; TXI, TEI, ERI follow */
++} sci_map[RA4M1_NUM_SCI] = {
++    { SCI_BASE + 0x000, 152 },  /* SCI0 */
++    { SCI_BASE + 0x020, 158 },  /* SCI1 */
++    { SCI_BASE + 0x040, 163 },  /* SCI2: D0/D1 on the UNO R4 */
++    { SCI_BASE + 0x120, 168 },  /* SCI9: Serial when built with NO_USB */
++};
++
++static const int agt_event[RA4M1_NUM_AGT] = { 30, 33 };   /* AGTn_INT */
++
++static uint64_t ra4m1_system_read(void *opaque, hwaddr addr, unsigned size)
++{
++    RA4M1State *s = opaque;
++    uint64_t v = 0;
++
++    for (unsigned i = 0; i < size; i++) {
++        uint8_t b = s->system_regs[addr + i];
++
++        if (addr + i == SYSTEM_OSCSF) {
++            b = 0x69;           /* HOCO, MOSC, PLL, PLL2: all stable */
++        } else if (addr + i == SYSTEM_VBTSR) {
++            b |= 0x10;          /* VBTRVLD */
++        }
++        v |= (uint64_t)b << (8 * i);
++    }
++    return v;
++}
++
++static void ra4m1_system_write(void *opaque, hwaddr addr, uint64_t val,
++                               unsigned size)
++{
++    RA4M1State *s = opaque;
++
++    for (unsigned i = 0; i < size; i++) {
++        s->system_regs[addr + i] = val >> (8 * i);
++    }
++}
++
++static const MemoryRegionOps ra4m1_system_ops = {
++    .read = ra4m1_system_read,
++    .write = ra4m1_system_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static void ra4m1_soc_init(Object *obj)
++{
++    RA4M1State *s = RA4M1_SOC(obj);
++
++    object_initialize_child(obj, "armv7m", &s->armv7m, TYPE_ARMV7M);
++    object_initialize_child(obj, "icu", &s->icu, TYPE_RENESAS_RA_ICU);
++    for (int i = 0; i < RA4M1_NUM_SCI; i++) {
++        object_initialize_child(obj, "sci[*]", &s->sci[i], TYPE_RENESAS_RA_SCI);
++    }
++    for (int i = 0; i < RA4M1_NUM_AGT; i++) {
++        object_initialize_child(obj, "agt[*]", &s->agt[i], TYPE_RENESAS_RA_AGT);
++    }
++    object_initialize_child(obj, "ioport", &s->ioport, TYPE_RENESAS_RA_IOPORT);
++    s->iclk = qdev_init_clock_in(DEVICE(s), "iclk", NULL, NULL, 0);
++    s->pclkb = qdev_init_clock_in(DEVICE(s), "pclkb", NULL, NULL, 0);
++    s->refclk = qdev_init_clock_in(DEVICE(s), "refclk", NULL, NULL, 0);
++}
++
++static void ra4m1_ram_block(RA4M1State *s, MemoryRegion *mr, const char *name,
++                            hwaddr base, uint64_t size, Error **errp)
++{
++    if (!memory_region_init_ram(mr, OBJECT(s), name, size, errp)) {
++        return;
++    }
++    memory_region_add_subregion(get_system_memory(), base, mr);
++}
++
++static void ra4m1_soc_realize(DeviceState *dev, Error **errp)
++{
++    RA4M1State *s = RA4M1_SOC(dev);
++    MemoryRegion *sysmem = get_system_memory();
++    DeviceState *armv7m = DEVICE(&s->armv7m);
++    DeviceState *icu = DEVICE(&s->icu);
++
++    if (!clock_has_source(s->iclk) || !clock_has_source(s->pclkb)) {
++        error_setg(errp, "ra4m1: iclk and pclkb must be connected");
++        return;
++    }
++    /* SysTick's external reference: unused by the FSP, but must exist */
++    clock_set_mul_div(s->refclk, 8, 1);
++    clock_set_source(s->refclk, s->iclk);
++
++    /* Memories */
++    if (!memory_region_init_rom(&s->flash, OBJECT(s), "ra4m1.flash",
++                                RA4M1_FLASH_SIZE, errp)) {
++        return;
++    }
++    memory_region_add_subregion(sysmem, RA4M1_FLASH_BASE, &s->flash);
++    ra4m1_ram_block(s, &s->sram, "ra4m1.sram", RA4M1_SRAM_BASE,
++                    RA4M1_SRAM_SIZE, errp);
++    ra4m1_ram_block(s, &s->dataflash, "ra4m1.dataflash", RA4M1_DATAFLASH_BASE,
++                    RA4M1_DATAFLASH_SIZE, errp);
++
++    /* CPU: Cortex-M4F, 32 ICU-routed IRQs, 4 priority bits */
++    qdev_prop_set_uint32(armv7m, "num-irq", RA_ICU_NUM_IRQS);
++    qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
++    qdev_prop_set_string(armv7m, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m4"));
++    /* no Security extension on the M4: the only VTOR is the NS one */
++    qdev_prop_set_uint32(armv7m, "init-nsvtor", s->init_svtor);
++    qdev_connect_clock_in(armv7m, "cpuclk", s->iclk);
++    qdev_connect_clock_in(armv7m, "refclk", s->refclk);
++    object_property_set_link(OBJECT(&s->armv7m), "memory", OBJECT(sysmem),
++                             &error_abort);
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->armv7m), errp)) {
++        return;
++    }
++
++    /* ICU: IELSRn -> NVIC IRQ n */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->icu), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->icu), 0, ICU_BASE);
++    for (int n = 0; n < RA_ICU_NUM_IRQS; n++) {
++        sysbus_connect_irq(SYS_BUS_DEVICE(&s->icu), n,
++                           qdev_get_gpio_in(armv7m, n));
++    }
++
++    /* SCI: RXI/TXI/TEI/ERI events into the ICU */
++    for (int i = 0; i < RA4M1_NUM_SCI; i++) {
++        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->sci[i]);
++
++        if (!sysbus_realize(sbd, errp)) {
++            return;
++        }
++        sysbus_mmio_map(sbd, 0, sci_map[i].base);
++        for (int e = 0; e < RA_SCI_NUM_EVENTS; e++) {
++            sysbus_connect_irq(sbd, e, qdev_get_gpio_in_named(
++                                   icu, "event", sci_map[i].event + e));
++        }
++    }
++
++    /* AGT: underflow events into the ICU */
++    for (int i = 0; i < RA4M1_NUM_AGT; i++) {
++        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->agt[i]);
++
++        qdev_connect_clock_in(DEVICE(sbd), "pclkb", s->pclkb);
++        if (!sysbus_realize(sbd, errp)) {
++            return;
++        }
++        sysbus_mmio_map(sbd, 0, AGT_BASE + i * 0x100);
++        sysbus_connect_irq(sbd, 0,
++                           qdev_get_gpio_in_named(icu, "event", agt_event[i]));
++    }
++
++    /* I/O ports and pin function select */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ioport), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->ioport), 0, PORT_BASE);
++
++    /* Control blocks that only need to remember what was written */
++    memory_region_init_io(&s->system, OBJECT(s), &ra4m1_system_ops, s,
++                          "ra4m1.system", sizeof(s->system_regs));
++    memory_region_add_subregion(sysmem, SYSTEM_BASE, &s->system);
++    /*
++     * FCACHE is deliberately left to the unimplemented region below: the FSP
++     * writes FCACHEIV=1 and waits for the hardware to clear it, so a plain
++     * register would hang the boot. Reading zero means "invalidation done".
++     */
++    ra4m1_ram_block(s, &s->mstp, "ra4m1.mstp", MSTP_BASE, 0x100, errp);
++
++    /* Everything else on the peripheral bus reads as zero */
++    create_unimplemented_device("ra4m1.peripherals", 0x40000000, 0x100000);
++    create_unimplemented_device("ra4m1.flash-if", 0x407e0000, 0x20000);
++}
++
++static const Property ra4m1_soc_properties[] = {
++    DEFINE_PROP_UINT32("init-svtor", RA4M1State, init_svtor, 0),
++};
++
++static void ra4m1_soc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = ra4m1_soc_realize;
++    device_class_set_props(dc, ra4m1_soc_properties);
++}
++
++static const TypeInfo ra4m1_soc_info = {
++    .name = TYPE_RA4M1_SOC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(RA4M1State),
++    .instance_init = ra4m1_soc_init,
++    .class_init = ra4m1_soc_class_init,
++};
++
++static void ra4m1_soc_register_types(void)
++{
++    type_register_static(&ra4m1_soc_info);
++}
++
++type_init(ra4m1_soc_register_types)
+diff --git a/include/hw/arm/ra4m1_soc.h b/include/hw/arm/ra4m1_soc.h
+new file mode 100644
+index 0000000..fa8105f
+--- /dev/null
++++ b/include/hw/arm/ra4m1_soc.h
+@@ -0,0 +1,62 @@
++/*
++ * Renesas RA4M1 (R7FA4M1AB) SoC
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_ARM_RA4M1_SOC_H
++#define HW_ARM_RA4M1_SOC_H
++
++#include "qemu/units.h"
++#include "hw/arm/armv7m.h"
++#include "hw/intc/renesas_ra_icu.h"
++#include "hw/char/renesas_ra_sci.h"
++#include "hw/timer/renesas_ra_agt.h"
++#include "hw/gpio/renesas_ra_ioport.h"
++#include "qom/object.h"
++
++#define TYPE_RA4M1_SOC "ra4m1-soc"
++OBJECT_DECLARE_SIMPLE_TYPE(RA4M1State, RA4M1_SOC)
++
++#define RA4M1_FLASH_BASE      0x00000000
++#define RA4M1_FLASH_SIZE      (256 * KiB)
++#define RA4M1_SRAM_BASE       0x20000000
++#define RA4M1_SRAM_SIZE       (32 * KiB)
++#define RA4M1_DATAFLASH_BASE  0x40100000
++#define RA4M1_DATAFLASH_SIZE  (8 * KiB)
++
++#define RA4M1_NUM_SCI  4    /* SCI0, SCI1, SCI2, SCI9 */
++#define RA4M1_NUM_AGT  2
++
++/*
++ * QEMU interface:
++ *  + Clock input "iclk": the CPU clock (48 MHz on the Arduino UNO R4)
++ *  + Clock input "pclkb": peripheral clock B (24 MHz on the UNO R4)
++ *  + property "init-svtor": reset value of VTOR. The Arduino bootloader
++ *    occupies the first 16 KiB, so sketches are linked at 0x4000.
++ *  + chardev properties of sci[n] for the serial ports
++ */
++struct RA4M1State {
++    SysBusDevice parent_obj;
++
++    ARMv7MState armv7m;
++    RenesasRAICUState icu;
++    RenesasRASCIState sci[RA4M1_NUM_SCI];
++    RenesasRAAGTState agt[RA4M1_NUM_AGT];
++    RenesasRAIOPortState ioport;
++
++    MemoryRegion flash;
++    MemoryRegion sram;
++    MemoryRegion dataflash;
++    MemoryRegion system;        /* clock generation, power control, ... */
++    MemoryRegion fcache;
++    MemoryRegion mstp;
++
++    uint8_t system_regs[0x1000];
++    uint32_t init_svtor;
++
++    Clock *iclk;
++    Clock *pclkb;
++    Clock *refclk;
++};
++
++#endif
+-- 
+2.55.0
+

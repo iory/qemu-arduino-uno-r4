@@ -1,0 +1,340 @@
+From 19d325fac20f0e271588bcee3c2cdb7aeb55c2ed Mon Sep 17 00:00:00 2001
+From: Iori Yanokura <ab.ioryz@gmail.com>
+Date: Mon, 21 Sep 2026 14:51:37 +0900
+Subject: [PATCH 2/5] hw/char: Add Renesas RA Serial Communications Interface
+ (SCI)
+
+Model the SCI in asynchronous (UART) mode, without FIFO, as used by the
+FSP r_sci_uart driver. Transmission is interrupt driven through the TXI
+and TEI events; the Arduino core spins until the TX-empty callback, so
+these events must be generated exactly as the FSP expects. Reception
+raises RXI.
+---
+ hw/char/Kconfig                  |   3 +
+ hw/char/meson.build              |   2 +
+ hw/char/renesas_ra_sci.c         | 246 +++++++++++++++++++++++++++++++
+ include/hw/char/renesas_ra_sci.h |  38 +++++
+ 4 files changed, 289 insertions(+)
+ create mode 100644 hw/char/renesas_ra_sci.c
+ create mode 100644 include/hw/char/renesas_ra_sci.h
+
+diff --git a/hw/char/Kconfig b/hw/char/Kconfig
+index 020c0a8..6984e96 100644
+--- a/hw/char/Kconfig
++++ b/hw/char/Kconfig
+@@ -95,3 +95,6 @@ config IP_OCTAL_232
+     bool
+     default y
+     depends on IPACK
++
++config RENESAS_RA_SCI
++    bool
+diff --git a/hw/char/meson.build b/hw/char/meson.build
+index fc3d7ee..806c485 100644
+--- a/hw/char/meson.build
++++ b/hw/char/meson.build
+@@ -41,3 +41,5 @@ system_ss.add(when: 'CONFIG_GOLDFISH_TTY', if_true: files('goldfish_tty.c'))
+ 
+ specific_ss.add(when: 'CONFIG_TERMINAL3270', if_true: files('terminal3270.c'))
+ specific_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr_vty.c'))
++
++system_ss.add(when: 'CONFIG_RENESAS_RA_SCI', if_true: files('renesas_ra_sci.c'))
+diff --git a/hw/char/renesas_ra_sci.c b/hw/char/renesas_ra_sci.c
+new file mode 100644
+index 0000000..318ace1
+--- /dev/null
++++ b/hw/char/renesas_ra_sci.c
+@@ -0,0 +1,246 @@
++/*
++ * Renesas RA Serial Communications Interface (SCI), asynchronous mode
++ *
++ * Only what the FSP r_sci_uart driver (as used by the Arduino core) needs:
++ * interrupt-driven transmit via TXI/TEI and receive via RXI, no FIFO.
++ * The Arduino core's UART::write() spins until the TX-empty callback, so
++ * TXI and TEI must be generated exactly as the FSP expects or the first
++ * Serial.print() hangs.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/char/renesas_ra_sci.h"
++
++#define R_SMR   0x00
++#define R_BRR   0x01
++#define R_SCR   0x02
++#define R_TDR   0x03
++#define R_SSR   0x04
++#define R_RDR   0x05
++
++#define SCR_TIE   0x80
++#define SCR_RIE   0x40
++#define SCR_TE    0x20
++#define SCR_RE    0x10
++#define SCR_TEIE  0x04
++
++#define SSR_TDRE  0x80
++#define SSR_RDRF  0x40
++#define SSR_ORER  0x20
++#define SSR_FER   0x10
++#define SSR_PER   0x08
++#define SSR_TEND  0x04
++#define SSR_W0C   (SSR_RDRF | SSR_ORER | SSR_FER | SSR_PER)  /* write 0 to clear */
++#define SSR_RW    0x03                                       /* MPB, MPBT */
++
++static void ra_sci_pulse(RenesasRASCIState *s, int ev)
++{
++    qemu_irq_pulse(s->event[ev]);
++}
++
++/* The byte in TDR has left the shifter: TDR is empty and the line idle. */
++static void ra_sci_tx_done(void *opaque)
++{
++    RenesasRASCIState *s = opaque;
++
++    s->ssr |= SSR_TDRE | SSR_TEND;
++    if (s->scr & SCR_TIE) {
++        ra_sci_pulse(s, RA_SCI_TXI);
++    }
++    if (s->scr & SCR_TEIE) {
++        ra_sci_pulse(s, RA_SCI_TEI);
++    }
++}
++
++static int ra_sci_can_receive(void *opaque)
++{
++    RenesasRASCIState *s = opaque;
++
++    return (s->scr & SCR_RE) && !(s->ssr & SSR_RDRF);
++}
++
++static void ra_sci_receive(void *opaque, const uint8_t *buf, int size)
++{
++    RenesasRASCIState *s = opaque;
++
++    s->rdr = buf[0];
++    s->ssr |= SSR_RDRF;
++    if (s->scr & SCR_RIE) {
++        ra_sci_pulse(s, RA_SCI_RXI);
++    }
++}
++
++static uint64_t ra_sci_read(void *opaque, hwaddr addr, unsigned size)
++{
++    RenesasRASCIState *s = opaque;
++
++    switch (addr) {
++    case R_SMR:
++        return s->smr;
++    case R_BRR:
++        return s->brr;
++    case R_SCR:
++        return s->scr;
++    case R_TDR:
++        return 0xff;
++    case R_SSR:
++        return s->ssr;
++    case R_RDR:
++        /* reading RDR frees it for the next character */
++        s->ssr &= ~SSR_RDRF;
++        qemu_chr_fe_accept_input(&s->chr);
++        return s->rdr;
++    default:
++        if (addr < sizeof(s->regs)) {
++            return s->regs[addr];
++        }
++        qemu_log_mask(LOG_UNIMP, "renesas-ra-sci: read 0x%" HWADDR_PRIx "\n",
++                      addr);
++        return 0;
++    }
++}
++
++static void ra_sci_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    RenesasRASCIState *s = opaque;
++    uint8_t v = val;
++
++    switch (addr) {
++    case R_SMR:
++        s->smr = v;
++        break;
++    case R_BRR:
++        s->brr = v;
++        break;
++    case R_SCR: {
++        uint8_t old = s->scr;
++        bool tx_was = (old & (SCR_TE | SCR_TIE)) == (SCR_TE | SCR_TIE);
++        bool tx_now = (v & (SCR_TE | SCR_TIE)) == (SCR_TE | SCR_TIE);
++
++        s->scr = v;
++        /* Setting TE+TIE with TDR empty requests the first byte (TXI). */
++        if (tx_now && !tx_was && (s->ssr & SSR_TDRE)) {
++            ra_sci_pulse(s, RA_SCI_TXI);
++        }
++        /* Enabling TEIE on an idle line reports "transmit end" (TEI). */
++        if ((v & SCR_TEIE) && !(old & SCR_TEIE) && (s->ssr & SSR_TEND)) {
++            ra_sci_pulse(s, RA_SCI_TEI);
++        }
++        if ((v & SCR_RIE) && !(old & SCR_RIE) && (s->ssr & SSR_RDRF)) {
++            ra_sci_pulse(s, RA_SCI_RXI);
++        }
++        if ((v & SCR_RE) && !(old & SCR_RE)) {
++            qemu_chr_fe_accept_input(&s->chr);
++        }
++        break;
++    }
++    case R_TDR:
++        if (!(s->scr & SCR_TE)) {
++            break;
++        }
++        qemu_chr_fe_write_all(&s->chr, &v, 1);
++        s->ssr &= ~(SSR_TDRE | SSR_TEND);
++        timer_mod(s->tx_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->char_time_ns);
++        break;
++    case R_SSR:
++        s->ssr = (s->ssr & ~SSR_RW) | (v & SSR_RW);
++        s->ssr &= v | ~SSR_W0C;
++        if (!(s->ssr & SSR_RDRF)) {
++            qemu_chr_fe_accept_input(&s->chr);
++        }
++        break;
++    case R_RDR:
++        break;
++    default:
++        if (addr < sizeof(s->regs)) {
++            s->regs[addr] = v;
++            break;
++        }
++        qemu_log_mask(LOG_UNIMP, "renesas-ra-sci: write 0x%" HWADDR_PRIx
++                      " = 0x%" PRIx64 "\n", addr, val);
++    }
++}
++
++static const MemoryRegionOps ra_sci_ops = {
++    .read = ra_sci_read,
++    .write = ra_sci_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 1,
++};
++
++static void ra_sci_reset(DeviceState *dev)
++{
++    RenesasRASCIState *s = RENESAS_RA_SCI(dev);
++
++    s->smr = 0;
++    s->brr = 0xff;
++    s->scr = 0;
++    s->ssr = SSR_TDRE | SSR_TEND;
++    s->rdr = 0;
++    memset(s->regs, 0, sizeof(s->regs));
++    timer_del(s->tx_timer);
++}
++
++static void ra_sci_realize(DeviceState *dev, Error **errp)
++{
++    RenesasRASCIState *s = RENESAS_RA_SCI(dev);
++
++    s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ra_sci_tx_done, s);
++    qemu_chr_fe_set_handlers(&s->chr, ra_sci_can_receive, ra_sci_receive,
++                             NULL, NULL, s, NULL, true);
++}
++
++static void ra_sci_init(Object *obj)
++{
++    RenesasRASCIState *s = RENESAS_RA_SCI(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &ra_sci_ops, s,
++                          TYPE_RENESAS_RA_SCI, 0x20);
++    sysbus_init_mmio(sbd, &s->iomem);
++    for (int i = 0; i < RA_SCI_NUM_EVENTS; i++) {
++        sysbus_init_irq(sbd, &s->event[i]);
++    }
++}
++
++static const Property ra_sci_properties[] = {
++    DEFINE_PROP_CHR("chardev", RenesasRASCIState, chr),
++    /* one 8N1 character at 115200 baud */
++    DEFINE_PROP_INT64("char-time-ns", RenesasRASCIState, char_time_ns, 86806),
++};
++
++static void ra_sci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = ra_sci_realize;
++    device_class_set_legacy_reset(dc, ra_sci_reset);
++    device_class_set_props(dc, ra_sci_properties);
++}
++
++static const TypeInfo ra_sci_info = {
++    .name = TYPE_RENESAS_RA_SCI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(RenesasRASCIState),
++    .instance_init = ra_sci_init,
++    .class_init = ra_sci_class_init,
++};
++
++static void ra_sci_register_types(void)
++{
++    type_register_static(&ra_sci_info);
++}
++
++type_init(ra_sci_register_types);
+diff --git a/include/hw/char/renesas_ra_sci.h b/include/hw/char/renesas_ra_sci.h
+new file mode 100644
+index 0000000..689bff3
+--- /dev/null
++++ b/include/hw/char/renesas_ra_sci.h
+@@ -0,0 +1,38 @@
++/*
++ * Renesas RA Serial Communications Interface (SCI), asynchronous mode
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_CHAR_RENESAS_RA_SCI_H
++#define HW_CHAR_RENESAS_RA_SCI_H
++
++#include "hw/core/sysbus.h"
++#include "chardev/char-fe.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_RENESAS_RA_SCI "renesas-ra-sci"
++OBJECT_DECLARE_SIMPLE_TYPE(RenesasRASCIState, RENESAS_RA_SCI)
++
++/*
++ * QEMU interface:
++ *  + sysbus MMIO region 0: the SCI register bank
++ *  + sysbus IRQ 0..3: RXI, TXI, TEI, ERI events (pulses, to the ICU)
++ *  + chardev property "chardev"
++ */
++enum { RA_SCI_RXI, RA_SCI_TXI, RA_SCI_TEI, RA_SCI_ERI, RA_SCI_NUM_EVENTS };
++
++struct RenesasRASCIState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    CharFrontend chr;
++    qemu_irq event[RA_SCI_NUM_EVENTS];
++    QEMUTimer *tx_timer;
++    int64_t char_time_ns;
++
++    uint8_t smr, brr, scr, ssr, rdr;
++    uint8_t regs[0x40];            /* SCMR, SEMR, SNFR, SPTR, ... kept as-is */
++};
++
++#endif
+-- 
+2.55.0
+

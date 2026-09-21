@@ -1,0 +1,98 @@
+name: release
+
+# Push a tag such as v11.1.1-unor4.1 to publish a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # 22.04 so the binaries also run on older distributions (glibc 2.35)
+          - { os: ubuntu-22.04, arch: x86_64 }
+          - { os: ubuntu-22.04-arm, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build pkg-config \
+            libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv python3-tomli
+      - run: ./build.sh
+      - run: tests/smoke.sh
+      - name: Package
+        run: |
+          name="qemu-arduino-uno-r4-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
+          mkdir -p "$name/bin"
+          cp dist/bin/qemu-system-arm "$name/bin/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: qemu-arduino-uno-r4-*.tar.gz
+
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build-wasm.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tests/run-wasm.mjs dist/wasm/qemu-system-arm.js tests/hello/hello.elf
+      - name: Package
+        run: |
+          name="qemu-arduino-uno-r4-${GITHUB_REF_NAME}-wasm"
+          mkdir -p "$name"
+          cp dist/wasm/qemu-system-arm.js dist/wasm/qemu-system-arm.wasm README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm
+          path: qemu-arduino-uno-r4-*.tar.gz
+
+  # GPL: ship the complete source the binaries were built from, with the
+  # scripts that build it.
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        run: |
+          src=$(./prepare-source.sh)
+          name="qemu-arduino-uno-r4-${GITHUB_REF_NAME}-source"
+          mkdir -p "$name"
+          mv "$src" "$name/"
+          cp -r README.md LICENSE QEMU_VERSION build.sh build-wasm.sh \
+                prepare-source.sh patches tests "$name/"
+          tar cJf "$name.tar.xz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: qemu-arduino-uno-r4-*-source.tar.xz
+
+  publish:
+    needs: [linux, wasm, source]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd assets && sha256sum * > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "qemu-system-arm with the arduino-uno-r4 machine. See README.md for usage."

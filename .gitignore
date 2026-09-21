@@ -1,0 +1,5 @@
+/work/
+/dist/
+
+# A global "ignore dotfiles" rule would otherwise hide the CI workflows.
+!/.github/

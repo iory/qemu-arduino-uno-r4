@@ -1,0 +1,348 @@
+From 9ac4037b1abad76a8d42e40c3ca86a0dcaf16cd2 Mon Sep 17 00:00:00 2001
+From: Iori Yanokura <ab.ioryz@gmail.com>
+Date: Mon, 21 Sep 2026 14:51:37 +0900
+Subject: [PATCH 3/5] hw/timer: Add Renesas RA Asynchronous General Purpose
+ Timer (AGT)
+
+A 16-bit down counter that reloads on underflow and raises the AGTI
+event. Only timer mode is modelled; this is what the Arduino UNO R4 core
+uses for millis(), with AGT0 underflowing every millisecond.
+---
+ hw/timer/Kconfig                  |   4 +
+ hw/timer/meson.build              |   2 +
+ hw/timer/renesas_ra_agt.c         | 254 ++++++++++++++++++++++++++++++
+ include/hw/timer/renesas_ra_agt.h |  39 +++++
+ 4 files changed, 299 insertions(+)
+ create mode 100644 hw/timer/renesas_ra_agt.c
+ create mode 100644 include/hw/timer/renesas_ra_agt.h
+
+diff --git a/hw/timer/Kconfig b/hw/timer/Kconfig
+index b3d823c..2a8f585 100644
+--- a/hw/timer/Kconfig
++++ b/hw/timer/Kconfig
+@@ -65,3 +65,7 @@ config STELLARIS_GPTM
+ 
+ config AVR_TIMER16
+     bool
++
++config RENESAS_RA_AGT
++    bool
++    select PTIMER
+diff --git a/hw/timer/meson.build b/hw/timer/meson.build
+index 201b5d8..92eb5a6 100644
+--- a/hw/timer/meson.build
++++ b/hw/timer/meson.build
+@@ -34,3 +34,5 @@ specific_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_timer.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_PWM', if_true: files('sifive_pwm.c'))
+ 
+ system_ss.add(when: 'CONFIG_AVR_TIMER16', if_true: files('avr_timer16.c'))
++
++system_ss.add(when: 'CONFIG_RENESAS_RA_AGT', if_true: files('renesas_ra_agt.c'))
+diff --git a/hw/timer/renesas_ra_agt.c b/hw/timer/renesas_ra_agt.c
+new file mode 100644
+index 0000000..f2b1d3d
+--- /dev/null
++++ b/hw/timer/renesas_ra_agt.c
+@@ -0,0 +1,254 @@
++/*
++ * Renesas RA Low Power Asynchronous General Purpose Timer (AGT)
++ *
++ * A 16-bit down counter that reloads on underflow. Timer mode only.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-clock.h"
++#include "hw/timer/renesas_ra_agt.h"
++
++#define R_AGT       0x00
++#define R_AGTCMA    0x02
++#define R_AGTCMB    0x04
++#define R_AGTCR     0x08
++#define R_AGTMR1    0x09
++#define R_AGTMR2    0x0a
++#define R_AGTIOC    0x0c
++#define R_AGTISR    0x0d
++#define R_AGTCMSR   0x0e
++#define R_AGTIOSEL  0x0f
++
++#define CR_TSTART   0x01
++#define CR_TCSTF    0x02    /* count status, read-only: follows TSTART */
++#define CR_TSTOP    0x04
++#define CR_FLAGS    0xf0    /* TEDGF, TUNDF, TCMAF, TCMBF: write 0 to clear */
++#define CR_TUNDF    0x20
++
++#define LOCO_HZ     32768   /* AGTLCLK / AGTSCLK */
++
++/* Frequency of the selected count source, in Hz (0 if unsupported). */
++static uint64_t ra_agt_source_hz(RenesasRAAGTState *s)
++{
++    uint64_t pclkb = clock_get_hz(s->pclkb);
++    unsigned cks = s->mr2 & 7;
++
++    switch ((s->mr1 >> 4) & 7) {
++    case 0:
++        return pclkb;
++    case 1:
++        return pclkb / 8;
++    case 3:
++        return pclkb / 2;
++    case 4:
++    case 6:
++        return LOCO_HZ >> cks;
++    default:
++        qemu_log_mask(LOG_UNIMP, "renesas-ra-agt: count source %d\n",
++                      (s->mr1 >> 4) & 7);
++        return 0;
++    }
++}
++
++static void ra_agt_tick(void *opaque)
++{
++    RenesasRAAGTState *s = opaque;
++
++    s->cr |= CR_TUNDF;
++    qemu_irq_pulse(s->agti);
++}
++
++/* Must be called inside a ptimer transaction. */
++static void ra_agt_update_freq(RenesasRAAGTState *s)
++{
++    uint64_t hz = ra_agt_source_hz(s);
++
++    if (hz) {
++        /* keeps the fractional part, so 24 MHz / 8 stays exactly 3 MHz */
++        ptimer_set_freq(s->timer, hz);
++    }
++}
++
++static void ra_agt_start(RenesasRAAGTState *s, bool run)
++{
++    ptimer_transaction_begin(s->timer);
++    if (run) {
++        ra_agt_update_freq(s);
++        ptimer_set_limit(s->timer, s->reload, 0);
++        ptimer_run(s->timer, 0);
++        s->cr |= CR_TSTART | CR_TCSTF;
++    } else {
++        ptimer_stop(s->timer);
++        s->cr &= ~(CR_TSTART | CR_TCSTF);
++    }
++    ptimer_transaction_commit(s->timer);
++}
++
++static uint64_t ra_agt_read(void *opaque, hwaddr addr, unsigned size)
++{
++    RenesasRAAGTState *s = opaque;
++
++    switch (addr) {
++    case R_AGT:
++        return ptimer_get_count(s->timer);
++    case R_AGTCMA:
++        return s->cma;
++    case R_AGTCMB:
++        return s->cmb;
++    case R_AGTCR:
++        return s->cr;
++    case R_AGTMR1:
++        return s->mr1;
++    case R_AGTMR2:
++        return s->mr2;
++    case R_AGTIOC:
++        return s->ioc;
++    case R_AGTISR:
++        return s->isr;
++    case R_AGTCMSR:
++        return s->cmsr;
++    case R_AGTIOSEL:
++        return s->iosel;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "renesas-ra-agt: read 0x%"
++                      HWADDR_PRIx "\n", addr);
++        return 0;
++    }
++}
++
++static void ra_agt_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    RenesasRAAGTState *s = opaque;
++
++    switch (addr) {
++    case R_AGT:
++        /* the reload register; also the counter while stopped */
++        s->reload = val;
++        ptimer_transaction_begin(s->timer);
++        ptimer_set_limit(s->timer, s->reload,
++                         !(s->cr & CR_TCSTF));
++        ptimer_transaction_commit(s->timer);
++        break;
++    case R_AGTCMA:
++        s->cma = val;
++        break;
++    case R_AGTCMB:
++        s->cmb = val;
++        break;
++    case R_AGTCR: {
++        uint8_t v = val;
++
++        s->cr = (s->cr & ~CR_FLAGS) | (s->cr & v & CR_FLAGS);
++        if (v & CR_TSTOP) {
++            /* forced stop: the counter goes back to the reload value */
++            ra_agt_start(s, false);
++            ptimer_transaction_begin(s->timer);
++            ptimer_set_count(s->timer, s->reload);
++            ptimer_transaction_commit(s->timer);
++        } else if ((v & CR_TSTART) != (s->cr & CR_TSTART)) {
++            ra_agt_start(s, v & CR_TSTART);
++        }
++        break;
++    }
++    case R_AGTMR1:
++        s->mr1 = val;
++        break;
++    case R_AGTMR2:
++        s->mr2 = val;
++        break;
++    case R_AGTIOC:
++        s->ioc = val;
++        break;
++    case R_AGTISR:
++        s->isr = val;
++        break;
++    case R_AGTCMSR:
++        s->cmsr = val;
++        break;
++    case R_AGTIOSEL:
++        s->iosel = val;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "renesas-ra-agt: write 0x%"
++                      HWADDR_PRIx " = 0x%" PRIx64 "\n", addr, val);
++    }
++}
++
++static const MemoryRegionOps ra_agt_ops = {
++    .read = ra_agt_read,
++    .write = ra_agt_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 2,
++};
++
++static void ra_agt_reset(DeviceState *dev)
++{
++    RenesasRAAGTState *s = RENESAS_RA_AGT(dev);
++
++    s->reload = 0xffff;
++    s->cma = s->cmb = 0xffff;
++    s->cr = s->mr1 = s->mr2 = s->ioc = s->isr = s->cmsr = s->iosel = 0;
++    ptimer_transaction_begin(s->timer);
++    ptimer_stop(s->timer);
++    ptimer_set_limit(s->timer, s->reload, 1);
++    ptimer_transaction_commit(s->timer);
++}
++
++static void ra_agt_realize(DeviceState *dev, Error **errp)
++{
++    RenesasRAAGTState *s = RENESAS_RA_AGT(dev);
++
++    if (!clock_has_source(s->pclkb)) {
++        error_setg(errp, "renesas-ra-agt: pclkb clock must be connected");
++        return;
++    }
++    s->timer = ptimer_init(ra_agt_tick, s,
++                           PTIMER_POLICY_WRAP_AFTER_ONE_PERIOD |
++                           PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT |
++                           PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
++                           PTIMER_POLICY_NO_COUNTER_ROUND_DOWN);
++}
++
++static void ra_agt_init(Object *obj)
++{
++    RenesasRAAGTState *s = RENESAS_RA_AGT(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &ra_agt_ops, s,
++                          TYPE_RENESAS_RA_AGT, 0x100);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->agti);
++    s->pclkb = qdev_init_clock_in(DEVICE(s), "pclkb", NULL, NULL, 0);
++}
++
++static void ra_agt_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = ra_agt_realize;
++    device_class_set_legacy_reset(dc, ra_agt_reset);
++}
++
++static const TypeInfo ra_agt_info = {
++    .name = TYPE_RENESAS_RA_AGT,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(RenesasRAAGTState),
++    .instance_init = ra_agt_init,
++    .class_init = ra_agt_class_init,
++};
++
++static void ra_agt_register_types(void)
++{
++    type_register_static(&ra_agt_info);
++}
++
++type_init(ra_agt_register_types);
+diff --git a/include/hw/timer/renesas_ra_agt.h b/include/hw/timer/renesas_ra_agt.h
+new file mode 100644
+index 0000000..ddf9244
+--- /dev/null
++++ b/include/hw/timer/renesas_ra_agt.h
+@@ -0,0 +1,39 @@
++/*
++ * Renesas RA Low Power Asynchronous General Purpose Timer (AGT)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_TIMER_RENESAS_RA_AGT_H
++#define HW_TIMER_RENESAS_RA_AGT_H
++
++#include "hw/core/sysbus.h"
++#include "hw/core/ptimer.h"
++#include "hw/core/clock.h"
++#include "qom/object.h"
++
++#define TYPE_RENESAS_RA_AGT "renesas-ra-agt"
++OBJECT_DECLARE_SIMPLE_TYPE(RenesasRAAGTState, RENESAS_RA_AGT)
++
++/*
++ * QEMU interface:
++ *  + Clock input "pclkb": peripheral clock B (the AGT's main count source)
++ *  + sysbus MMIO region 0: the AGT register bank
++ *  + sysbus IRQ 0: AGTI (underflow) event, pulsed, to the ICU
++ *
++ * Only timer mode (TMOD=0) is modelled. That is what the Arduino core uses
++ * for millis(): AGT0 underflows every 1 ms and micros() reads the counter.
++ */
++struct RenesasRAAGTState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq agti;
++    Clock *pclkb;
++    struct ptimer_state *timer;
++
++    uint16_t reload;
++    uint16_t cma, cmb;
++    uint8_t cr, mr1, mr2, ioc, isr, cmsr, iosel;
++};
++
++#endif
+-- 
+2.55.0
+

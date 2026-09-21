@@ -1,0 +1,377 @@
+From 8e2f140c25a92ebd43aa51374f406149911f8266 Mon Sep 17 00:00:00 2001
+From: Iori Yanokura <ab.ioryz@gmail.com>
+Date: Mon, 21 Sep 2026 14:51:37 +0900
+Subject: [PATCH 4/5] hw/gpio: Add Renesas RA I/O ports and pin function select
+ (PFS)
+
+Model PORT0..9 (PCNTR1..4), the PmnPFS registers and PMISC. The 16-bit
+aliases of these registers do not follow little-endian byte lanes (the
+alias at +0 of PCNTR1 is PODR, which is bits 31:16 of the 32-bit view),
+so accesses are decoded by width. PODR/PDR are shared between the port
+and PFS views, and every pin exposes its output level as a GPIO line.
+---
+ hw/gpio/Kconfig                     |   3 +
+ hw/gpio/meson.build                 |   2 +
+ hw/gpio/renesas_ra_ioport.c         | 279 ++++++++++++++++++++++++++++
+ include/hw/gpio/renesas_ra_ioport.h |  42 +++++
+ 4 files changed, 326 insertions(+)
+ create mode 100644 hw/gpio/renesas_ra_ioport.c
+ create mode 100644 include/hw/gpio/renesas_ra_ioport.h
+
+diff --git a/hw/gpio/Kconfig b/hw/gpio/Kconfig
+index a209294..42bdaa1 100644
+--- a/hw/gpio/Kconfig
++++ b/hw/gpio/Kconfig
+@@ -30,3 +30,6 @@ config PCF8574
+ 
+ config ZAURUS_SCOOP
+     bool
++
++config RENESAS_RA_IOPORT
++    bool
+diff --git a/hw/gpio/meson.build b/hw/gpio/meson.build
+index 6a67ee9..7ddbeb0 100644
+--- a/hw/gpio/meson.build
++++ b/hw/gpio/meson.build
+@@ -19,3 +19,5 @@ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_gpio.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_sgpio.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_GPIO', if_true: files('sifive_gpio.c'))
+ system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
++
++system_ss.add(when: 'CONFIG_RENESAS_RA_IOPORT', if_true: files('renesas_ra_ioport.c'))
+diff --git a/hw/gpio/renesas_ra_ioport.c b/hw/gpio/renesas_ra_ioport.c
+new file mode 100644
+index 0000000..9c8ac25
+--- /dev/null
++++ b/hw/gpio/renesas_ra_ioport.c
+@@ -0,0 +1,279 @@
++/*
++ * Renesas RA I/O ports (PORTn) and pin function select (PFS)
++ *
++ * Register access follows the Renesas convention of 16-bit aliases that
++ * do NOT line up with little-endian byte lanes: in the 32-bit PCNTR1 the
++ * direction (PDR) is bits 15:0 and the output data (PODR) bits 31:16, yet
++ * the 16-bit alias at +0 is PODR and the one at +2 is PDR. Likewise the
++ * PFS register has a 16-bit alias at +2 and an 8-bit one at +3 that both
++ * refer to its low bits. So accesses are decoded by width, not by byte.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/core/irq.h"
++#include "hw/gpio/renesas_ra_ioport.h"
++
++#define PORT_STRIDE  0x20
++#define PFS_BASE     0x800
++#define PFS_STRIDE   0x40
++#define PMISC_BASE   0xd00
++
++/* PmnPFS bits that live in the port registers rather than in pfs[] */
++#define PFS_PODR     (1u << 0)
++#define PFS_PIDR     (1u << 1)
++#define PFS_PDR      (1u << 2)
++#define PFS_PCR      (1u << 4)
++#define PFS_PORT_BITS (PFS_PODR | PFS_PIDR | PFS_PDR)
++
++/* Level seen on a pin: what we drive if it is an output, else the pull-up */
++static uint16_t ra_ioport_pidr(RenesasRAIOPortState *s, int p)
++{
++    uint16_t pullup = 0;
++
++    for (int n = 0; n < RA_IOPORT_NUM_PINS; n++) {
++        if (s->pfs[p][n] & PFS_PCR) {
++            pullup |= 1u << n;
++        }
++    }
++    return (s->podr[p] & s->pdr[p]) | (pullup & ~s->pdr[p]);
++}
++
++static void ra_ioport_update(RenesasRAIOPortState *s, int p,
++                             uint16_t old_level)
++{
++    uint16_t level = s->podr[p] & s->pdr[p];
++    uint16_t changed = level ^ old_level;
++
++    for (int n = 0; n < RA_IOPORT_NUM_PINS; n++) {
++        if (changed & (1u << n)) {
++            qemu_set_irq(s->pin_out[p * RA_IOPORT_NUM_PINS + n],
++                         (level >> n) & 1);
++        }
++    }
++}
++
++/* ---- PORTn: PCNTR1..4 ------------------------------------------------ */
++
++static uint64_t ra_port_read(RenesasRAIOPortState *s, int p, hwaddr off,
++                             unsigned size)
++{
++    uint16_t pidr = ra_ioport_pidr(s, p);
++
++    if (size == 4) {
++        switch (off) {
++        case 0x0: return ((uint32_t)s->podr[p] << 16) | s->pdr[p];  /* PCNTR1 */
++        case 0x4: return pidr;                   /* PCNTR2: EIDR=0 | PIDR */
++        case 0x8: return 0;                      /* PCNTR3 is write-only */
++        case 0xc: return (uint32_t)s->eodr[p] << 16;
++        }
++    } else if (size == 2) {
++        switch (off) {
++        case 0x0: return s->podr[p];
++        case 0x2: return s->pdr[p];
++        case 0x4: return 0;                      /* EIDR */
++        case 0x6: return pidr;
++        case 0x8: case 0xa: return 0;            /* PORR / POSR */
++        case 0xc: return s->eodr[p];
++        case 0xe: return 0;
++        }
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "renesas-ra-ioport: port%d read +0x%"
++                  HWADDR_PRIx " size %u\n", p, off, size);
++    return 0;
++}
++
++static void ra_port_write(RenesasRAIOPortState *s, int p, hwaddr off,
++                          uint64_t val, unsigned size)
++{
++    uint16_t old_level = s->podr[p] & s->pdr[p];
++
++    if (size == 4) {
++        switch (off) {
++        case 0x0:                                /* PCNTR1 */
++            s->pdr[p] = val;
++            s->podr[p] = val >> 16;
++            break;
++        case 0x8:                                /* PCNTR3: PORR | POSR */
++            s->podr[p] |= val & 0xffff;
++            s->podr[p] &= ~(val >> 16);
++            break;
++        case 0xc:
++            s->eodr[p] = val >> 16;
++            break;
++        default:
++            goto bad;
++        }
++    } else if (size == 2) {
++        switch (off) {
++        case 0x0: s->podr[p] = val; break;
++        case 0x2: s->pdr[p] = val; break;
++        case 0x8: s->podr[p] &= ~val; break;     /* PORR */
++        case 0xa: s->podr[p] |= val; break;      /* POSR */
++        case 0xc: case 0xe: break;
++        default: goto bad;
++        }
++    } else {
++        goto bad;
++    }
++    ra_ioport_update(s, p, old_level);
++    return;
++bad:
++    qemu_log_mask(LOG_GUEST_ERROR, "renesas-ra-ioport: port%d write +0x%"
++                  HWADDR_PRIx " size %u = 0x%" PRIx64 "\n", p, off, size, val);
++}
++
++/* ---- PFS: PmnPFS, with 16-bit (+2) and 8-bit (+3) aliases ------------- */
++
++static uint32_t ra_pfs_get(RenesasRAIOPortState *s, int p, int n)
++{
++    uint32_t v = s->pfs[p][n] & ~PFS_PORT_BITS;
++
++    v |= (s->podr[p] >> n & 1) ? PFS_PODR : 0;
++    v |= (ra_ioport_pidr(s, p) >> n & 1) ? PFS_PIDR : 0;
++    v |= (s->pdr[p] >> n & 1) ? PFS_PDR : 0;
++    return v;
++}
++
++static void ra_pfs_set(RenesasRAIOPortState *s, int p, int n, uint32_t v)
++{
++    uint16_t old_level = s->podr[p] & s->pdr[p];
++    uint16_t bit = 1u << n;
++
++    s->pfs[p][n] = v & ~PFS_PORT_BITS;
++    s->podr[p] = (v & PFS_PODR) ? (s->podr[p] | bit) : (s->podr[p] & ~bit);
++    s->pdr[p] = (v & PFS_PDR) ? (s->pdr[p] | bit) : (s->pdr[p] & ~bit);
++    ra_ioport_update(s, p, old_level);
++}
++
++static uint64_t ra_pfs_read(RenesasRAIOPortState *s, int p, int n,
++                            hwaddr off, unsigned size)
++{
++    uint32_t v = ra_pfs_get(s, p, n);
++
++    if (size == 4 && off == 0) {
++        return v;
++    } else if (size == 2 && off == 2) {
++        return v & 0xffff;                       /* PmnPFS_HA */
++    } else if (size == 1 && off == 3) {
++        return v & 0xff;                         /* PmnPFS_BY */
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "renesas-ra-ioport: P%d%02d PFS read +%"
++                  HWADDR_PRIx " size %u\n", p, n, off, size);
++    return 0;
++}
++
++static void ra_pfs_write(RenesasRAIOPortState *s, int p, int n, hwaddr off,
++                         uint64_t val, unsigned size)
++{
++    uint32_t v = ra_pfs_get(s, p, n);
++
++    if (size == 4 && off == 0) {
++        v = val;
++    } else if (size == 2 && off == 2) {
++        v = (v & 0xffff0000) | (val & 0xffff);
++    } else if (size == 1 && off == 3) {
++        v = (v & 0xffffff00) | (val & 0xff);
++    } else {
++        qemu_log_mask(LOG_GUEST_ERROR, "renesas-ra-ioport: P%d%02d PFS write +%"
++                      HWADDR_PRIx " size %u\n", p, n, off, size);
++        return;
++    }
++    ra_pfs_set(s, p, n, v);
++}
++
++/* ---- dispatch ---------------------------------------------------------- */
++
++static uint64_t ra_ioport_read(void *opaque, hwaddr addr, unsigned size)
++{
++    RenesasRAIOPortState *s = opaque;
++
++    if (addr < RA_IOPORT_NUM_PORTS * PORT_STRIDE) {
++        return ra_port_read(s, addr / PORT_STRIDE, addr % PORT_STRIDE, size);
++    }
++    if (addr >= PFS_BASE && addr < PFS_BASE + RA_IOPORT_NUM_PORTS * PFS_STRIDE) {
++        hwaddr o = addr - PFS_BASE;
++        return ra_pfs_read(s, o / PFS_STRIDE, (o % PFS_STRIDE) / 4, o % 4, size);
++    }
++    if (addr >= PMISC_BASE && addr + size <= PMISC_BASE + sizeof(s->pmisc)) {
++        uint64_t v = 0;
++        memcpy(&v, &s->pmisc[addr - PMISC_BASE], size);
++        return le64_to_cpu(v);
++    }
++    return 0;
++}
++
++static void ra_ioport_write(void *opaque, hwaddr addr, uint64_t val,
++                            unsigned size)
++{
++    RenesasRAIOPortState *s = opaque;
++
++    if (addr < RA_IOPORT_NUM_PORTS * PORT_STRIDE) {
++        ra_port_write(s, addr / PORT_STRIDE, addr % PORT_STRIDE, val, size);
++    } else if (addr >= PFS_BASE &&
++               addr < PFS_BASE + RA_IOPORT_NUM_PORTS * PFS_STRIDE) {
++        hwaddr o = addr - PFS_BASE;
++        ra_pfs_write(s, o / PFS_STRIDE, (o % PFS_STRIDE) / 4, o % 4, val, size);
++    } else if (addr >= PMISC_BASE &&
++               addr + size <= PMISC_BASE + sizeof(s->pmisc)) {
++        uint64_t v = cpu_to_le64(val);
++        memcpy(&s->pmisc[addr - PMISC_BASE], &v, size);   /* PWPR etc. */
++    }
++}
++
++static const MemoryRegionOps ra_ioport_ops = {
++    .read = ra_ioport_read,
++    .write = ra_ioport_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++};
++
++static void ra_ioport_reset(DeviceState *dev)
++{
++    RenesasRAIOPortState *s = RENESAS_RA_IOPORT(dev);
++
++    memset(s->podr, 0, sizeof(s->podr));
++    memset(s->pdr, 0, sizeof(s->pdr));
++    memset(s->eodr, 0, sizeof(s->eodr));
++    memset(s->pfs, 0, sizeof(s->pfs));
++    memset(s->pmisc, 0, sizeof(s->pmisc));
++    s->pmisc[3] = 0x80;                          /* PWPR: B0WI set */
++}
++
++static void ra_ioport_init(Object *obj)
++{
++    RenesasRAIOPortState *s = RENESAS_RA_IOPORT(obj);
++
++    memory_region_init_io(&s->iomem, obj, &ra_ioport_ops, s,
++                          TYPE_RENESAS_RA_IOPORT, 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    qdev_init_gpio_out_named(DEVICE(obj), s->pin_out, "pin",
++                             RA_IOPORT_NUM_PORTS * RA_IOPORT_NUM_PINS);
++}
++
++static void ra_ioport_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, ra_ioport_reset);
++}
++
++static const TypeInfo ra_ioport_info = {
++    .name = TYPE_RENESAS_RA_IOPORT,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(RenesasRAIOPortState),
++    .instance_init = ra_ioport_init,
++    .class_init = ra_ioport_class_init,
++};
++
++static void ra_ioport_register_types(void)
++{
++    type_register_static(&ra_ioport_info);
++}
++
++type_init(ra_ioport_register_types);
+diff --git a/include/hw/gpio/renesas_ra_ioport.h b/include/hw/gpio/renesas_ra_ioport.h
+new file mode 100644
+index 0000000..512004a
+--- /dev/null
++++ b/include/hw/gpio/renesas_ra_ioport.h
+@@ -0,0 +1,42 @@
++/*
++ * Renesas RA I/O ports (PORTn) and pin function select (PFS)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_GPIO_RENESAS_RA_IOPORT_H
++#define HW_GPIO_RENESAS_RA_IOPORT_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_RENESAS_RA_IOPORT "renesas-ra-ioport"
++OBJECT_DECLARE_SIMPLE_TYPE(RenesasRAIOPortState, RENESAS_RA_IOPORT)
++
++#define RA_IOPORT_NUM_PORTS  10
++#define RA_IOPORT_NUM_PINS   16
++
++/*
++ * QEMU interface:
++ *  + sysbus MMIO region 0: PORT0..9, PFS and PMISC (0x1000 bytes from
++ *    the PORT0 base)
++ *  + named GPIO outputs "pin" [port * 16 + pin]: output level of each pin
++ *    while it is configured as an output
++ *
++ * Both views of a pin stay consistent: the PODR/PDR bits of PCNTR1 and the
++ * same bits of PmnPFS are one piece of state, and PCNTR3 sets/resets it.
++ * Inputs float low unless the pull-up (PCR) is on; nothing drives them yet.
++ */
++struct RenesasRAIOPortState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq pin_out[RA_IOPORT_NUM_PORTS * RA_IOPORT_NUM_PINS];
++
++    uint16_t podr[RA_IOPORT_NUM_PORTS];
++    uint16_t pdr[RA_IOPORT_NUM_PORTS];
++    uint16_t eodr[RA_IOPORT_NUM_PORTS];     /* event output data */
++    uint32_t pfs[RA_IOPORT_NUM_PORTS][RA_IOPORT_NUM_PINS];  /* other bits */
++    uint8_t pmisc[0x10];                    /* PWPR and friends */
++};
++
++#endif
+-- 
+2.55.0
+

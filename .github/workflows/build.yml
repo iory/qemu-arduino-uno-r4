@@ -1,0 +1,56 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  native:
+    name: native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build pkg-config \
+            libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv python3-tomli
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkgconf glib pixman dtc
+
+      # The QEMU tarball is ~135 MB; keep it between runs.
+      - uses: actions/cache@v4
+        with:
+          path: work/qemu-*.tar.xz
+          key: qemu-tarball-${{ hashFiles('QEMU_VERSION') }}
+
+      - run: ./build.sh
+      - run: tests/smoke.sh
+
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: work/qemu-*.tar.xz
+          key: qemu-tarball-${{ hashFiles('QEMU_VERSION') }}
+
+      - run: ./build-wasm.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: node tests/run-wasm.mjs dist/wasm/qemu-system-arm.js tests/hello/hello.elf

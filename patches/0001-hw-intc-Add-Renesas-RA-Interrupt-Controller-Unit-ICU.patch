@@ -1,0 +1,237 @@
+From 33e673b25ca626f9c45661827dd9678d7d71ae08 Mon Sep 17 00:00:00 2001
+From: Iori Yanokura <ab.ioryz@gmail.com>
+Date: Mon, 21 Sep 2026 14:51:37 +0900
+Subject: [PATCH 1/5] hw/intc: Add Renesas RA Interrupt Controller Unit (ICU)
+
+The ICU of the Renesas RA family routes peripheral events (numbered as
+in the ELC event table) to NVIC lines through the IELSRn registers. An
+event latches the IR flag of every IELSR that selects it, and the NVIC
+line follows IR until software writes IR=0, which the Renesas FSP does
+at the start of every interrupt handler.
+---
+ hw/intc/Kconfig                  |   3 +
+ hw/intc/meson.build              |   2 +
+ hw/intc/renesas_ra_icu.c         | 143 +++++++++++++++++++++++++++++++
+ include/hw/intc/renesas_ra_icu.h |  39 +++++++++
+ 4 files changed, 187 insertions(+)
+ create mode 100644 hw/intc/renesas_ra_icu.c
+ create mode 100644 include/hw/intc/renesas_ra_icu.h
+
+diff --git a/hw/intc/Kconfig b/hw/intc/Kconfig
+index 1fec78f..a1b03b4 100644
+--- a/hw/intc/Kconfig
++++ b/hw/intc/Kconfig
+@@ -117,3 +117,6 @@ config LOONGARCH_EXTIOI
+ 
+ config LOONGARCH_DINTC
+     bool
++
++config RENESAS_RA_ICU
++    bool
+diff --git a/hw/intc/meson.build b/hw/intc/meson.build
+index f6c7f08..368e1d7 100644
+--- a/hw/intc/meson.build
++++ b/hw/intc/meson.build
+@@ -88,3 +88,5 @@ specific_ss.add(when: 'CONFIG_LOONGARCH_EXTIOI', if_true: files('loongarch_extio
+ specific_ss.add(when: ['CONFIG_KVM', 'CONFIG_LOONGARCH_EXTIOI'],
+                if_true: files('loongarch_extioi_kvm.c'))
+ specific_ss.add(when: 'CONFIG_LOONGARCH_DINTC', if_true: files('loongarch_dintc.c'))
++
++system_ss.add(when: 'CONFIG_RENESAS_RA_ICU', if_true: files('renesas_ra_icu.c'))
+diff --git a/hw/intc/renesas_ra_icu.c b/hw/intc/renesas_ra_icu.c
+new file mode 100644
+index 0000000..15c8a01
+--- /dev/null
++++ b/hw/intc/renesas_ra_icu.c
+@@ -0,0 +1,143 @@
++/*
++ * Renesas RA Interrupt Controller Unit (ICU)
++ *
++ * Routes peripheral events (the ELC event table) to NVIC IRQ lines through
++ * the IELSRn registers, and latches the IR flag that the FSP clears in
++ * software at the start of every interrupt handler.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/core/irq.h"
++#include "hw/intc/renesas_ra_icu.h"
++
++#define IELSR_BASE      0x300
++#define IELSR_IELS_MASK 0x1ff
++#define IELSR_IR        (1u << 16)
++#define IELSR_DTCE      (1u << 24)
++
++static void ra_icu_update(RenesasRAICUState *s, int n)
++{
++    qemu_set_irq(s->irq[n], !!(s->ielsr[n] & IELSR_IR));
++}
++
++/* A peripheral raised an event: latch IR on every slot that selects it. */
++static void ra_icu_event(void *opaque, int event, int level)
++{
++    RenesasRAICUState *s = opaque;
++
++    if (!level) {
++        return;                     /* events are edges; IR is the latch */
++    }
++    for (int n = 0; n < RA_ICU_NUM_IRQS; n++) {
++        if ((s->ielsr[n] & IELSR_IELS_MASK) == (uint32_t)event) {
++            s->ielsr[n] |= IELSR_IR;
++            ra_icu_update(s, n);
++        }
++    }
++}
++
++static uint64_t ra_icu_read(void *opaque, hwaddr addr, unsigned size)
++{
++    RenesasRAICUState *s = opaque;
++
++    if (addr >= IELSR_BASE && addr < IELSR_BASE + 4 * RA_ICU_NUM_IRQS) {
++        int n = (addr - IELSR_BASE) / 4;
++        int shift = (addr & 3) * 8;
++        return extract64(s->ielsr[n], shift, size * 8);
++    }
++    if (addr + size <= sizeof(s->regs)) {
++        uint64_t v = 0;
++        memcpy(&v, &s->regs[addr], size);
++        return le64_to_cpu(v);
++    }
++    qemu_log_mask(LOG_UNIMP, "renesas-ra-icu: read 0x%" HWADDR_PRIx "\n", addr);
++    return 0;
++}
++
++static void ra_icu_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    RenesasRAICUState *s = opaque;
++
++    if (addr >= IELSR_BASE && addr < IELSR_BASE + 4 * RA_ICU_NUM_IRQS) {
++        int n = (addr - IELSR_BASE) / 4;
++        int shift = (addr & 3) * 8;
++        uint32_t old = s->ielsr[n];
++        uint32_t neu = deposit32(old, shift, size * 8, val);
++
++        /* IR: writing 0 clears it, writing 1 leaves it as it was */
++        uint32_t ir = old & neu & IELSR_IR;
++
++        s->ielsr[n] = (neu & (IELSR_IELS_MASK | IELSR_DTCE)) | ir;
++        ra_icu_update(s, n);
++        return;
++    }
++    if (addr + size <= sizeof(s->regs)) {
++        uint64_t v = cpu_to_le64(val);
++        memcpy(&s->regs[addr], &v, size);
++        return;
++    }
++    qemu_log_mask(LOG_UNIMP, "renesas-ra-icu: write 0x%" HWADDR_PRIx
++                  " = 0x%" PRIx64 "\n", addr, val);
++}
++
++static const MemoryRegionOps ra_icu_ops = {
++    .read = ra_icu_read,
++    .write = ra_icu_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++};
++
++static void ra_icu_reset(DeviceState *dev)
++{
++    RenesasRAICUState *s = RENESAS_RA_ICU(dev);
++
++    memset(s->ielsr, 0, sizeof(s->ielsr));
++    memset(s->regs, 0, sizeof(s->regs));
++    for (int n = 0; n < RA_ICU_NUM_IRQS; n++) {
++        ra_icu_update(s, n);
++    }
++}
++
++static void ra_icu_init(Object *obj)
++{
++    RenesasRAICUState *s = RENESAS_RA_ICU(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &ra_icu_ops, s,
++                          TYPE_RENESAS_RA_ICU, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    for (int n = 0; n < RA_ICU_NUM_IRQS; n++) {
++        sysbus_init_irq(sbd, &s->irq[n]);
++    }
++    qdev_init_gpio_in_named(DEVICE(obj), ra_icu_event, "event",
++                            RA_ICU_NUM_EVENTS);
++}
++
++static void ra_icu_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, ra_icu_reset);
++}
++
++static const TypeInfo ra_icu_info = {
++    .name = TYPE_RENESAS_RA_ICU,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(RenesasRAICUState),
++    .instance_init = ra_icu_init,
++    .class_init = ra_icu_class_init,
++};
++
++static void ra_icu_register_types(void)
++{
++    type_register_static(&ra_icu_info);
++}
++
++type_init(ra_icu_register_types);
+diff --git a/include/hw/intc/renesas_ra_icu.h b/include/hw/intc/renesas_ra_icu.h
+new file mode 100644
+index 0000000..97b80ea
+--- /dev/null
++++ b/include/hw/intc/renesas_ra_icu.h
+@@ -0,0 +1,39 @@
++/*
++ * Renesas RA Interrupt Controller Unit (ICU)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef HW_INTC_RENESAS_RA_ICU_H
++#define HW_INTC_RENESAS_RA_ICU_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_RENESAS_RA_ICU "renesas-ra-icu"
++OBJECT_DECLARE_SIMPLE_TYPE(RenesasRAICUState, RENESAS_RA_ICU)
++
++#define RA_ICU_NUM_IRQS    32      /* NVIC entries routable through IELSR */
++#define RA_ICU_NUM_EVENTS  0x200   /* ELC event numbers (IELS is 9 bits) */
++
++/*
++ * QEMU interface:
++ *  + sysbus MMIO region 0: the ICU register bank
++ *  + named GPIO inputs "event" [0..RA_ICU_NUM_EVENTS): peripheral events,
++ *    numbered as in the ELC event table (e.g. 168 = SCI9_RXI)
++ *  + sysbus IRQs [0..RA_ICU_NUM_IRQS): to the NVIC
++ *
++ * Each IELSRn selects one event for NVIC IRQ n. An event latches the IR
++ * flag of every IELSR that selects it; the NVIC line follows IR until the
++ * guest writes IR=0, which is what the FSP does at the top of every ISR.
++ */
++struct RenesasRAICUState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq[RA_ICU_NUM_IRQS];
++
++    uint32_t ielsr[RA_ICU_NUM_IRQS];
++    uint8_t regs[0x300];           /* IRQCR, NMICR, NMIER, ... kept as-is */
++};
++
++#endif
+-- 
+2.55.0
+
