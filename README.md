@@ -143,13 +143,14 @@ serial output against the text.
 
 ## Releases
 
-Pushing a tag `v<qemu-version>-unor4.<n>` (e.g. `v11.1.1-unor4.2`) builds
+Pushing a tag `v<qemu-version>-unor4.<n>` (e.g. `v11.1.1-unor4.4`) builds
 and publishes:
 
 | Asset | Contents | Needs |
 | --- | --- | --- |
 | `…-linux-x86_64.tar.gz`, `…-linux-arm64.tar.gz` | `bin/qemu-system-arm` | glib (`libglib2.0-0`), present on almost every distribution; glibc 2.35 or newer (Ubuntu 22.04+) |
 | `…-macos-arm64.tar.gz` | `bin/qemu-system-arm` and `lib/` | Apple silicon, macOS 14 or newer |
+| `…-macos-x86_64.tar.gz` | the same, for Intel | Intel Mac, macOS 15 or newer (built on GitHub's last Intel runner, `macos-15-intel`) |
 | `…-windows-x86_64.zip` | `bin/qemu-system-arm.exe` and its DLLs | Windows 10/11 on x64 |
 | `…-windows-arm64.zip` | the same, built for ARM64 | Windows 11 on ARM (the x64 build does not work under emulation there) |
 | `…-wasm.tar.gz` | `qemu-system-arm.{js,wasm}` | see [WebAssembly](#webassembly) |
@@ -162,7 +163,7 @@ browser is quarantined, and macOS then refuses to run it; clear the flag once
 after unpacking:
 
 ```sh
-xattr -dr com.apple.quarantine qemu-arduino-uno-r4-*-macos-arm64
+xattr -dr com.apple.quarantine qemu-arduino-uno-r4-*-macos-*
 ```
 
 (`curl` does not set the flag, so this is not needed for scripted downloads.)
