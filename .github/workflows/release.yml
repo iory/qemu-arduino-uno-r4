@@ -61,8 +61,13 @@ jobs:
           path: qemu-arduino-uno-r4-*.tar.gz
 
   windows:
-    name: windows-x86_64
-    runs-on: windows-2022
+    name: windows-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { os: windows-2022, msystem: UCRT64, arch: x86_64 }
+          - { os: windows-11-arm, msystem: CLANGARM64, arch: arm64 }
     defaults:
       run:
         shell: msys2 {0}
@@ -70,28 +75,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
           update: true
-          install: >-
-            git curl patch tar xz diffutils zip
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-glib2
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-python
+          install: git curl patch tar xz diffutils zip
+          pacboy: cc:p glib2:p ninja:p pkgconf:p python:p
       - run: ./build.sh
       - run: scripts/bundle-windows.sh dist
       - run: tests/smoke.sh dist/bin/qemu-system-arm.exe
       - name: Package
         run: |
-          name="qemu-arduino-uno-r4-${GITHUB_REF_NAME}-windows-x86_64"
+          name="qemu-arduino-uno-r4-${GITHUB_REF_NAME}-windows-${{ matrix.arch }}"
           mkdir -p "$name"
           cp -r dist/bin "$name/"
           cp README.md LICENSE "$name/"
           zip -qr "$name.zip" "$name"
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64
+          name: windows-${{ matrix.arch }}
           path: qemu-arduino-uno-r4-*.zip
 
   wasm:

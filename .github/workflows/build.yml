@@ -44,7 +44,16 @@ jobs:
           tests/smoke.sh
 
   windows:
-    runs-on: windows-2022
+    name: windows (${{ matrix.msystem }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, msystem: UCRT64 }
+          # Native: the x64 build crashes under ARM64 emulation (Prism) as
+          # soon as TCG runs guest code.
+          - { os: windows-11-arm, msystem: CLANGARM64 }
     defaults:
       run:
         shell: msys2 {0}
@@ -53,15 +62,10 @@ jobs:
 
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
           update: true
-          install: >-
-            git curl patch tar xz diffutils
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-glib2
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-python
+          install: git curl patch tar xz diffutils
+          pacboy: cc:p glib2:p ninja:p pkgconf:p python:p
 
       - uses: actions/cache@v4
         with:
@@ -79,6 +83,11 @@ jobs:
           $out = & dist\bin\qemu-system-arm.exe -machine help | Select-String '^arduino-uno-r4 '
           if (-not $out) { throw 'arduino-uno-r4 machine not listed' }
           $out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.msystem }}
+          path: dist/bin
 
   wasm:
     runs-on: ubuntu-24.04

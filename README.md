@@ -93,7 +93,8 @@ into `dist/lib` and points the binary there, so it runs without Homebrew.
 
 ### Native (Windows)
 
-In an [MSYS2](https://www.msys2.org/) **UCRT64** shell:
+In an [MSYS2](https://www.msys2.org/) **UCRT64** shell (on ARM64, use
+**CLANGARM64** and `mingw-w64-clang-aarch64-{clang,…}` instead):
 
 ```sh
 pacman -S git curl patch tar xz diffutils \
@@ -149,7 +150,8 @@ and publishes:
 | --- | --- | --- |
 | `…-linux-x86_64.tar.gz`, `…-linux-arm64.tar.gz` | `bin/qemu-system-arm` | glib (`libglib2.0-0`), present on almost every distribution; glibc 2.35 or newer (Ubuntu 22.04+) |
 | `…-macos-arm64.tar.gz` | `bin/qemu-system-arm` and `lib/` | Apple silicon, macOS 14 or newer |
-| `…-windows-x86_64.zip` | `bin/qemu-system-arm.exe` and its DLLs | Windows 10/11 (x64; runs on ARM64 under emulation) |
+| `…-windows-x86_64.zip` | `bin/qemu-system-arm.exe` and its DLLs | Windows 10/11 on x64 |
+| `…-windows-arm64.zip` | the same, built for ARM64 | Windows 11 on ARM (the x64 build does not work under emulation there) |
 | `…-wasm.tar.gz` | `qemu-system-arm.{js,wasm}` | see [WebAssembly](#webassembly) |
 | `…-source.tar.xz` | the complete patched QEMU tree the binaries were built from, with these scripts | |
 
