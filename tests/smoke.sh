@@ -10,8 +10,11 @@ ELF=$HERE/hello/hello.elf
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
 
-"$QEMU" -M arduino-uno-r4 -kernel "$ELF" -display none -monitor none \
-        -serial "file:$out" 2>/dev/null &
+# A Windows build of QEMU (run from MSYS2 bash) needs Windows paths.
+native() { if command -v cygpath >/dev/null; then cygpath -m "$1"; else echo "$1"; fi; }
+
+"$QEMU" -M arduino-uno-r4 -kernel "$(native "$ELF")" -display none -monitor none \
+        -serial "file:$(native "$out")" 2>/dev/null &
 pid=$!
 for _ in $(seq 100); do
     grep -q "D13:" "$out" 2>/dev/null && break

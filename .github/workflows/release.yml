@@ -24,7 +24,7 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y build-essential ninja-build pkg-config \
-            libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv python3-tomli
+            libglib2.0-dev python3-venv python3-tomli
       - run: ./build.sh
       - run: tests/smoke.sh
       - name: Package
@@ -38,6 +38,61 @@ jobs:
         with:
           name: linux-${{ matrix.arch }}
           path: qemu-arduino-uno-r4-*.tar.gz
+
+  macos:
+    name: macos-arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ninja pkgconf glib
+      - run: ./build.sh
+      - run: scripts/bundle-macos.sh dist
+      - run: tests/smoke.sh
+      - name: Package
+        run: |
+          name="qemu-arduino-uno-r4-${GITHUB_REF_NAME}-macos-arm64"
+          mkdir -p "$name"
+          cp -R dist/bin dist/lib "$name/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: qemu-arduino-uno-r4-*.tar.gz
+
+  windows:
+    name: windows-x86_64
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git curl patch tar xz diffutils zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+      - run: ./build.sh
+      - run: scripts/bundle-windows.sh dist
+      - run: tests/smoke.sh dist/bin/qemu-system-arm.exe
+      - name: Package
+        run: |
+          name="qemu-arduino-uno-r4-${GITHUB_REF_NAME}-windows-x86_64"
+          mkdir -p "$name"
+          cp -r dist/bin "$name/"
+          cp README.md LICENSE "$name/"
+          zip -qr "$name.zip" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: qemu-arduino-uno-r4-*.zip
 
   wasm:
     runs-on: ubuntu-24.04
@@ -72,7 +127,7 @@ jobs:
           mkdir -p "$name"
           mv "$src" "$name/"
           cp -r README.md LICENSE QEMU_VERSION build.sh build-wasm.sh \
-                prepare-source.sh patches tests "$name/"
+                prepare-source.sh patches scripts tests "$name/"
           tar cJf "$name.tar.xz" "$name"
       - uses: actions/upload-artifact@v4
         with:
@@ -80,7 +135,7 @@ jobs:
           path: qemu-arduino-uno-r4-*-source.tar.xz
 
   publish:
-    needs: [linux, wasm, source]
+    needs: [linux, macos, windows, wasm, source]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

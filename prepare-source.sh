@@ -5,6 +5,7 @@
 #
 # The result is also the "corresponding source" shipped with every release.
 # Environment: WORK=dir (default: ./work)
+# Requirements: curl, git, patch, xz
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -42,4 +43,17 @@ for p in "$ROOT"/patches/*.patch; do
     echo "   $(basename "$p")" >&2
     patch -d "$src" -p1 --forward --quiet < "$p"
 done
+
+# The build links QEMU's pinned copy of dtc (libfdt) statically. Meson would
+# clone it at configure time; do it here instead so that the tree printed
+# below is complete, which is what the source release needs.
+wrap_get() { sed -n "s/^$1 *= *//p" "$src/subprojects/dtc.wrap"; }
+dtc_url=$(wrap_get url)
+dtc_rev=$(wrap_get revision)
+echo ">> fetching dtc $dtc_rev" >&2
+git init --quiet "$src/subprojects/dtc"
+git -C "$src/subprojects/dtc" fetch --quiet --depth 1 "$dtc_url" "$dtc_rev"
+git -C "$src/subprojects/dtc" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
+rm -rf "$src/subprojects/dtc/.git"
+
 echo "$WORK/$src"

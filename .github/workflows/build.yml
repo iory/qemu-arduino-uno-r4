@@ -22,11 +22,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential ninja-build pkg-config \
-            libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv python3-tomli
+            libglib2.0-dev python3-venv python3-tomli
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja pkgconf glib pixman dtc
+        run: brew install ninja pkgconf glib
 
       # The QEMU tarball is ~135 MB; keep it between runs.
       - uses: actions/cache@v4
@@ -36,6 +36,49 @@ jobs:
 
       - run: ./build.sh
       - run: tests/smoke.sh
+
+      - name: Bundle the dylibs (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          scripts/bundle-macos.sh dist
+          tests/smoke.sh
+
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git curl patch tar xz diffutils
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+
+      - uses: actions/cache@v4
+        with:
+          path: work/qemu-*.tar.xz
+          key: qemu-tarball-${{ hashFiles('QEMU_VERSION') }}
+
+      - run: ./build.sh
+      - run: scripts/bundle-windows.sh dist
+      - run: tests/smoke.sh dist/bin/qemu-system-arm.exe
+
+      # Outside MSYS2 nothing but the bundled DLLs is on the search path.
+      - name: Run without MSYS2
+        shell: pwsh
+        run: |
+          $out = & dist\bin\qemu-system-arm.exe -machine help | Select-String '^arduino-uno-r4 '
+          if (-not $out) { throw 'arduino-uno-r4 machine not listed' }
+          $out
 
   wasm:
     runs-on: ubuntu-24.04
