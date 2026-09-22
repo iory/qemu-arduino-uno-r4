@@ -110,6 +110,7 @@ tests/smoke.sh dist/bin/qemu-system-arm.exe
 ```sh
 ./build-wasm.sh                # -> dist/wasm/qemu-system-arm.{js,wasm}
 node tests/run-wasm.mjs dist/wasm/qemu-system-arm.js tests/hello/hello.elf
+node tests/run-wasm-host.mjs dist/wasm/qemu-system-arm.js tests/hello/hello.elf
 ```
 
 This uses QEMU's own Emscripten cross-build container, so Docker is the only
@@ -123,6 +124,14 @@ page (`Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`) served from `https` or
 `localhost`.
 
+A page cannot reach QEMU's sockets, so with `-serial none` the board
+connects SCI9 to two ring buffers in the wasm heap instead, and on start-up
+calls `Module.unor4Attach(info)` on the page's main thread. `info` gives the
+addresses of the rings, of the guest SRAM and of the port output latches
+(`PODR`), so the page can type into the guest, show its output and draw the
+LEDs without pausing the CPU. `tests/run-wasm-host.mjs` shows the protocol;
+the book's repository uses it for a simulator that runs on GitHub Pages.
+
 Performance is the limit: the interpreter executes far fewer instructions per
 second than the real 48 MHz part. With `-icount shift=auto` timers and
 blinking stay close to real time but computation is very slow; with
@@ -132,11 +141,13 @@ blinking stay close to real time but computation is very slow; with
 
 - `tests/hello/` is a tiny bare-metal program linked at 0x4000. It prints a
   line on SCI9 and drives D13 through `PCNTR3`, reading it back through
-  `PCNTR1`. Rebuild it with `make -C tests/hello` (needs
+  `PCNTR1`, then echoes whatever it receives. Rebuild it with `make -C tests/hello` (needs
   `arm-none-eabi-gcc`); the ELF is committed so the tests do not need a
   cross compiler.
 - `tests/smoke.sh` and `tests/run-wasm.mjs` boot it on the native and the
   WebAssembly builds.
+- `tests/run-wasm-host.mjs` drives it through the WebAssembly host
+  interface: output and input through the rings, D13 through `PODR`.
 
 The book's repository runs all its chapters on this machine and checks the
 serial output against the text.

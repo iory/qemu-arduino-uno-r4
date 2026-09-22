@@ -1,7 +1,7 @@
 From 6ca3be32f48e8ad6061b17949baef8f763957f3d Mon Sep 17 00:00:00 2001
 From: Iori Yanokura <ab.ioryz@gmail.com>
 Date: Mon, 21 Sep 2026 14:51:37 +0900
-Subject: [PATCH 5/5] hw/arm: Add Renesas RA4M1 SoC and Arduino UNO R4 board
+Subject: [PATCH 5/6] hw/arm: Add Renesas RA4M1 SoC and Arduino UNO R4 board
 
 Add the RA4M1 (R7FA4M1AB, Cortex-M4F) with its ICU, SCI0/1/2/9, AGT0/1
 and I/O ports, plus the arduino-uno-r4 board that boots sketches built by

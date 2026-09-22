@@ -1,7 +1,7 @@
 From 9ac4037b1abad76a8d42e40c3ca86a0dcaf16cd2 Mon Sep 17 00:00:00 2001
 From: Iori Yanokura <ab.ioryz@gmail.com>
 Date: Mon, 21 Sep 2026 14:51:37 +0900
-Subject: [PATCH 3/5] hw/timer: Add Renesas RA Asynchronous General Purpose
+Subject: [PATCH 3/6] hw/timer: Add Renesas RA Asynchronous General Purpose
  Timer (AGT)
 
 A 16-bit down counter that reloads on underflow and raises the AGTI
