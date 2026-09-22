@@ -1,7 +1,7 @@
-From 19d325fac20f0e271588bcee3c2cdb7aeb55c2ed Mon Sep 17 00:00:00 2001
+From 0332263b2b3a88a1e2cc7a5d1d0c884555c009db Mon Sep 17 00:00:00 2001
 From: Iori Yanokura <ab.ioryz@gmail.com>
 Date: Mon, 21 Sep 2026 14:51:37 +0900
-Subject: [PATCH 2/5] hw/char: Add Renesas RA Serial Communications Interface
+Subject: [PATCH 2/6] hw/char: Add Renesas RA Serial Communications Interface
  (SCI)
 
 Model the SCI in asynchronous (UART) mode, without FIFO, as used by the
@@ -12,9 +12,9 @@ raises RXI.
 ---
  hw/char/Kconfig                  |   3 +
  hw/char/meson.build              |   2 +
- hw/char/renesas_ra_sci.c         | 246 +++++++++++++++++++++++++++++++
+ hw/char/renesas_ra_sci.c         | 253 +++++++++++++++++++++++++++++++
  include/hw/char/renesas_ra_sci.h |  38 +++++
- 4 files changed, 289 insertions(+)
+ 4 files changed, 296 insertions(+)
  create mode 100644 hw/char/renesas_ra_sci.c
  create mode 100644 include/hw/char/renesas_ra_sci.h
 
@@ -41,10 +41,10 @@ index fc3d7ee..806c485 100644
 +system_ss.add(when: 'CONFIG_RENESAS_RA_SCI', if_true: files('renesas_ra_sci.c'))
 diff --git a/hw/char/renesas_ra_sci.c b/hw/char/renesas_ra_sci.c
 new file mode 100644
-index 0000000..318ace1
+index 0000000..f32bc9b
 --- /dev/null
 +++ b/hw/char/renesas_ra_sci.c
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,253 @@
 +/*
 + * Renesas RA Serial Communications Interface (SCI), asynchronous mode
 + *
@@ -139,11 +139,18 @@ index 0000000..318ace1
 +        return 0xff;
 +    case R_SSR:
 +        return s->ssr;
-+    case R_RDR:
-+        /* reading RDR frees it for the next character */
++    case R_RDR: {
++        /*
++         * Reading RDR frees it for the next character. Latch the value
++         * first: a back end may deliver that character from within
++         * accept_input, which would overwrite rdr before we return it.
++         */
++        uint8_t v = s->rdr;
++
 +        s->ssr &= ~SSR_RDRF;
 +        qemu_chr_fe_accept_input(&s->chr);
-+        return s->rdr;
++        return v;
++    }
 +    default:
 +        if (addr < sizeof(s->regs)) {
 +            return s->regs[addr];
@@ -336,5 +343,5 @@ index 0000000..689bff3
 +
 +#endif
 -- 
-2.55.0
+2.53.0
 
