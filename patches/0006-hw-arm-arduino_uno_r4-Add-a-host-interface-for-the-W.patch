@@ -1,0 +1,214 @@
+From 90eb180a5961769955dd84fcb08ca88fa12f24fe Mon Sep 17 00:00:00 2001
+From: Iori Yanokura <ab.ioryz@gmail.com>
+Date: Tue, 22 Sep 2026 11:31:25 +0900
+Subject: [PATCH 6/6] hw/arm/arduino_uno_r4: Add a host interface for the
+ WebAssembly build
+
+A browser page cannot connect to QEMU's TCP serial port or QMP, so the
+Emscripten build had no way to type into the guest or to show the LEDs.
+
+On Emscripten, when no serial0 is given (-serial none), connect SCI9 to
+an internal chardev that exchanges bytes with the page through two
+rings in the shared wasm heap. After the machine is built, call
+Module.unor4Attach() on the page's main thread with the addresses of
+the rings, the SRAM and the port output latches, so the page can read
+the LED matrix frame buffer and D13 in place without pausing the CPU.
+
+Native builds are unchanged.
+---
+ hw/arm/arduino_uno_r4.c | 160 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 159 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/arduino_uno_r4.c b/hw/arm/arduino_uno_r4.c
+index 4c8eea2..6a577ed 100644
+--- a/hw/arm/arduino_uno_r4.c
++++ b/hw/arm/arduino_uno_r4.c
+@@ -22,11 +22,166 @@
+ #define UNO_R4_PCLKB_HZ  24000000ULL    /* ICLK / 2 */
+ #define UNO_R4_APP_BASE  0x4000         /* after the bootloader */
+ 
++#ifdef __EMSCRIPTEN__
++/*
++ * WebAssembly host interface.
++ *
++ * A browser page cannot open QEMU's sockets, so it talks to the board
++ * through the wasm heap instead, which it shares with QEMU's threads:
++ *
++ *  - SRAM and the port output latches (PODR) are read in place, so the
++ *    page can draw LEDs without stopping the CPU.
++ *  - Serial bytes go through two single-producer rings. QEMU writes the
++ *    output ring and the page drains it; the page writes the input ring
++ *    and QEMU drains it when SCI9 can take a byte.
++ *
++ * The rings are used for SCI9 when no serial0 is given (-serial none).
++ * On start-up the board calls Module.unor4Attach(info) on the page's main
++ * thread with the addresses the page needs.
++ */
++#include <emscripten.h>
++#include "chardev/char.h"
++#include "qemu/timer.h"
++
++#define UNO_R4_WASM_OUT_SIZE  (64 * KiB)
++#define UNO_R4_WASM_IN_SIZE   (4 * KiB)
++#define UNO_R4_WASM_POLL_MS   2
++
++/* Indices only grow (mod 2^32); a byte lives at data[index % size]. */
++typedef struct UnoR4WasmRings {
++    uint32_t out_head;      /* written by QEMU */
++    uint32_t out_tail;      /* written by the page */
++    uint32_t in_head;       /* written by the page */
++    uint32_t in_tail;       /* written by QEMU */
++    uint32_t out_dropped;   /* bytes lost because the page fell behind */
++    uint8_t out[UNO_R4_WASM_OUT_SIZE];
++    uint8_t in[UNO_R4_WASM_IN_SIZE];
++} UnoR4WasmRings;
++
++static UnoR4WasmRings uno_r4_wasm_rings;
++
++#define TYPE_CHARDEV_UNO_R4_WASM "chardev-uno-r4-wasm"
++
++typedef struct UnoR4WasmChardev {
++    Chardev parent;
++    QEMUTimer *poll;
++} UnoR4WasmChardev;
++
++DECLARE_INSTANCE_CHECKER(UnoR4WasmChardev, UNO_R4_WASM_CHARDEV,
++                         TYPE_CHARDEV_UNO_R4_WASM)
++
++static int uno_r4_wasm_chr_write(Chardev *chr, const uint8_t *buf, int len)
++{
++    UnoR4WasmRings *r = &uno_r4_wasm_rings;
++    uint32_t head = r->out_head;
++    uint32_t tail = qatomic_load_acquire(&r->out_tail);
++    int i;
++
++    for (i = 0; i < len && head - tail < UNO_R4_WASM_OUT_SIZE; i++) {
++        r->out[head % UNO_R4_WASM_OUT_SIZE] = buf[i];
++        head++;
++    }
++    qatomic_store_release(&r->out_head, head);
++    if (i < len) {
++        /* Never block the guest on the page; count what was lost instead. */
++        qatomic_set(&r->out_dropped, r->out_dropped + (len - i));
++    }
++    return len;
++}
++
++static void uno_r4_wasm_chr_accept_input(Chardev *chr)
++{
++    UnoR4WasmRings *r = &uno_r4_wasm_rings;
++    uint32_t tail = r->in_tail;
++    uint32_t head = qatomic_load_acquire(&r->in_head);
++
++    while (tail != head && qemu_chr_be_can_write(chr) > 0) {
++        uint8_t c = r->in[tail % UNO_R4_WASM_IN_SIZE];
++
++        qemu_chr_be_write(chr, &c, 1);
++        tail++;
++    }
++    qatomic_store_release(&r->in_tail, tail);
++}
++
++static void uno_r4_wasm_chr_poll(void *opaque)
++{
++    UnoR4WasmChardev *s = UNO_R4_WASM_CHARDEV(opaque);
++
++    uno_r4_wasm_chr_accept_input(CHARDEV(s));
++    timer_mod(s->poll, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
++                       UNO_R4_WASM_POLL_MS);
++}
++
++static bool uno_r4_wasm_chr_open(Chardev *chr, ChardevBackend *backend,
++                                 Error **errp)
++{
++    UnoR4WasmChardev *s = UNO_R4_WASM_CHARDEV(chr);
++
++    s->poll = timer_new_ms(QEMU_CLOCK_REALTIME, uno_r4_wasm_chr_poll, s);
++    uno_r4_wasm_chr_poll(s);
++    return true;
++}
++
++static void uno_r4_wasm_chr_class_init(ObjectClass *oc, const void *data)
++{
++    ChardevClass *cc = CHARDEV_CLASS(oc);
++
++    cc->internal = true;
++    cc->chr_open = uno_r4_wasm_chr_open;
++    cc->chr_write = uno_r4_wasm_chr_write;
++    cc->chr_accept_input = uno_r4_wasm_chr_accept_input;
++}
++
++static const TypeInfo uno_r4_wasm_chr_info = {
++    .name = TYPE_CHARDEV_UNO_R4_WASM,
++    .parent = TYPE_CHARDEV,
++    .instance_size = sizeof(UnoR4WasmChardev),
++    .class_init = uno_r4_wasm_chr_class_init,
++};
++
++static void uno_r4_wasm_register_types(void)
++{
++    type_register_static(&uno_r4_wasm_chr_info);
++}
++
++type_init(uno_r4_wasm_register_types)
++
++static void uno_r4_wasm_attach(RA4M1State *soc)
++{
++    /* Sizes are cast to int: KiB is 64-bit, which would reach JS as BigInt. */
++    MAIN_THREAD_EM_ASM({
++        if (typeof Module.unor4Attach !== 'function') {
++            return;
++        }
++        Module.unor4Attach({
++            heap: () => HEAPU8,
++            sram: Number($0), sramBase: $1 >>> 0, sramSize: $2,
++            podr: Number($3), ports: $4,
++            rings: Number($5),
++            outOffset: $6, outSize: $7, inOffset: $8, inSize: $9,
++        });
++    }, memory_region_get_ram_ptr(&soc->sram), (int)RA4M1_SRAM_BASE,
++       (int)RA4M1_SRAM_SIZE, soc->ioport.podr, RA_IOPORT_NUM_PORTS,
++       &uno_r4_wasm_rings,
++       (int)offsetof(UnoR4WasmRings, out), (int)UNO_R4_WASM_OUT_SIZE,
++       (int)offsetof(UnoR4WasmRings, in), (int)UNO_R4_WASM_IN_SIZE);
++}
++#endif /* __EMSCRIPTEN__ */
++
+ static void arduino_uno_r4_init(MachineState *machine)
+ {
+     DeviceState *dev;
+     RA4M1State *soc;
+     Clock *iclk, *pclkb;
++    Chardev *serial0 = serial_hd(0);
++
++#ifdef __EMSCRIPTEN__
++    if (!serial0) {
++        serial0 = qemu_chardev_new(NULL, TYPE_CHARDEV_UNO_R4_WASM,
++                                   NULL, NULL, &error_fatal);
++    }
++#endif
+ 
+     iclk = clock_new(OBJECT(machine), "ICLK");
+     clock_set_hz(iclk, UNO_R4_ICLK_HZ);
+@@ -39,7 +194,7 @@ static void arduino_uno_r4_init(MachineState *machine)
+     qdev_connect_clock_in(dev, "iclk", iclk);
+     qdev_connect_clock_in(dev, "pclkb", pclkb);
+     qdev_prop_set_uint32(dev, "init-svtor", UNO_R4_APP_BASE);
+-    qdev_prop_set_chr(DEVICE(&soc->sci[3]), "chardev", serial_hd(0)); /* SCI9 */
++    qdev_prop_set_chr(DEVICE(&soc->sci[3]), "chardev", serial0);      /* SCI9 */
+     /*
+      * On the real board Serial is USB CDC, which is not limited to 115200
+      * baud. SCI9 stands in for it, so let it send about as fast as USB.
+@@ -51,6 +206,9 @@ static void arduino_uno_r4_init(MachineState *machine)
+ 
+     armv7m_load_kernel(soc->armv7m.cpu, machine->kernel_filename,
+                        0, RA4M1_FLASH_SIZE);
++#ifdef __EMSCRIPTEN__
++    uno_r4_wasm_attach(soc);
++#endif
+ }
+ 
+ static void arduino_uno_r4_machine_init(MachineClass *mc)
+-- 
+2.53.0
+

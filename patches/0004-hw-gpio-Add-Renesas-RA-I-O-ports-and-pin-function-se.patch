@@ -1,7 +1,7 @@
 From 8e2f140c25a92ebd43aa51374f406149911f8266 Mon Sep 17 00:00:00 2001
 From: Iori Yanokura <ab.ioryz@gmail.com>
 Date: Mon, 21 Sep 2026 14:51:37 +0900
-Subject: [PATCH 4/5] hw/gpio: Add Renesas RA I/O ports and pin function select
+Subject: [PATCH 4/6] hw/gpio: Add Renesas RA I/O ports and pin function select
  (PFS)
 
 Model PORT0..9 (PCNTR1..4), the PmnPFS registers and PMISC. The 16-bit

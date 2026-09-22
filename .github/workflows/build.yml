@@ -112,3 +112,4 @@ jobs:
           node-version: 22
 
       - run: node tests/run-wasm.mjs dist/wasm/qemu-system-arm.js tests/hello/hello.elf
+      - run: node tests/run-wasm-host.mjs dist/wasm/qemu-system-arm.js tests/hello/hello.elf

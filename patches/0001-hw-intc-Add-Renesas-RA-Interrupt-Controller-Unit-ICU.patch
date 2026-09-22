@@ -1,7 +1,7 @@
 From 33e673b25ca626f9c45661827dd9678d7d71ae08 Mon Sep 17 00:00:00 2001
 From: Iori Yanokura <ab.ioryz@gmail.com>
 Date: Mon, 21 Sep 2026 14:51:37 +0900
-Subject: [PATCH 1/5] hw/intc: Add Renesas RA Interrupt Controller Unit (ICU)
+Subject: [PATCH 1/6] hw/intc: Add Renesas RA Interrupt Controller Unit (ICU)
 
 The ICU of the Renesas RA family routes peripheral events (numbered as
 in the ELC event table) to NVIC lines through the IELSRn registers. An
