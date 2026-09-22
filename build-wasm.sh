@@ -41,11 +41,13 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 
 echo ">> building qemu-system-arm.js ($JOBS jobs)"
-# The container runs as root; hand the build tree back to the caller.
+# The container runs as root; hand back everything it wrote, including the
+# __pycache__ that configure leaves under scripts/ (otherwise the next
+# prepare-source.sh cannot remove the tree).
 owner="$(id -u):$(id -g)"
 docker run --rm -v "$src:/qemu" -w /qemu "$IMAGE" bash -c "
     set -e
-    trap 'chown -R $owner /qemu/build-wasm' EXIT
+    trap 'chown -R $owner /qemu' EXIT
     mkdir -p build-wasm && cd build-wasm
     emconfigure ../configure --static --cpu=wasm64 --wasm64-32bit-address-limit \
         --enable-tcg-interpreter --disable-tools --disable-docs \
